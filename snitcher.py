@@ -740,22 +740,29 @@ def find_building_contours(binary_mask):
 
 def simplify_polygon(contour, epsilon_factor=3.0):
     """
-    Simplify polygon using Douglas-Peucker algorithm.
-    This reduces vertices to corner points only.
+    Simplify polygon to corner points using Douglas-Peucker algorithm.
 
-    Uses a fixed epsilon value instead of perimeter-based to ensure
-    consistent simplification across all building sizes.
-    Small buildings should not have more vertices than large ones.
+    For buildings, we want to preserve right angles and corners while
+    removing unnecessary intermediate points along straight edges.
+
+    Args:
+        contour: OpenCV contour
+        epsilon_factor: Simplification tolerance in pixels (higher = simpler)
+
+    Returns:
+        Simplified contour
     """
-    # Use a fixed epsilon value (in pixels) for consistent simplification
-    # epsilon_factor is now interpreted as a fixed pixel tolerance
-    # Typical good values: 2-5 pixels for building corners
-    epsilon = epsilon_factor if epsilon_factor > 1 else epsilon_factor * 100
+    # Calculate perimeter
+    perimeter = cv2.arcLength(contour, True)
 
-    # Approximate polygon
-    approx = cv2.approxPolyDP(contour, epsilon, True)
+    # Epsilon: allowed deviation in pixels
+    # Typical values: 2-5 pixels for buildings
+    epsilon = epsilon_factor
 
-    return approx
+    # Apply Douglas-Peucker simplification
+    simplified = cv2.approxPolyDP(contour, epsilon, True)
+
+    return simplified
 
 
 def contours_to_geojson(contours, image_shape):
