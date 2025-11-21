@@ -97,7 +97,7 @@ def separate_buildings(alpha, black_borders):
     return binary, markers, dilated_borders
 
 
-def snap_contours_to_borders(contours, black_borders, snap_distance=3):
+def snap_contours_to_borders(contours, offset_distance=2.0):
     """
     OPTIMIZED: Geometric Buffering Approach (replaces O(V×P) pixel search).
 
@@ -244,11 +244,13 @@ def snap_contours_to_borders(contours, black_borders, snap_distance=3):
 
     return buffered_contours
 
-def subdivide_edges_with_vertices(contours, tolerance=2.0):
+def subdivide_edges_with_vertices_opt_old(contours, tolerance=2.0):
     """
     OSM edge subdivision (OPTIMIZED with spatial indexing).
     Only checks vertices near each edge instead of all vertices.
     """
+    from scipy.spatial import cKDTree
+
     # Collect all unique vertices
     all_vertices = set()
     for contour in contours:
@@ -328,22 +330,190 @@ def subdivide_edges_with_vertices(contours, tolerance=2.0):
 
     return subdivided_contours
 
-
-def point_to_segment_distance(point, seg_start, seg_end):
+def subdivide_edges_with_vertices_opt_new(contours, tolerance=2.0):
     """
-    Calculate the minimum distance from a point to a line segment.
+    OSM Topology: Insert vertices from adjacent polygons into edges.
+    OPTIMIZED with spatial indexing for performance.
+    """
+    from scipy.spatial import cKDTree
+
+    # Build vertex index: map each vertex to its source buildings
+    vertex_to_buildings = {}
+    building_vertices = []  # List of (building_idx, vertex_array)
+
+    for contour_idx, contour in enumerate(contours):
+        for point in contour:
+            vertex = tuple(point[0])
+            if vertex not in vertex_to_buildings:
+                vertex_to_buildings[vertex] = []
+                building_vertices.append(np.array(vertex, dtype=float))
+            vertex_to_buildings[vertex].append(contour_idx)
+
+    # Build KD-tree for fast spatial queries
+    if len(building_vertices) == 0:
+        return contours
+
+    vertex_array = np.array(building_vertices)
+    kdtree = cKDTree(vertex_array)
+
+    subdivided_contours = []
+    total_insertions = 0
+
+    for contour_idx, contour in enumerate(contours):
+        new_vertices = []
+        num_vertices = len(contour)
+
+        for i in range(num_vertices):
+            v1 = np.array(contour[i][0], dtype=float)
+            v2 = np.array(contour[(i + 1) % num_vertices][0], dtype=float)
+
+            new_vertices.append(v1)
+
+            # Find vertices near this edge using KD-tree
+            # Query along the edge midpoint with expanded search radius
+            edge_midpoint = (v1 + v2) / 2
+            edge_length = np.linalg.norm(v2 - v1)
+            search_radius = edge_length / 2 + tolerance
+
+            # Find candidate vertices near this edge
+            candidate_indices = kdtree.query_ball_point(edge_midpoint, search_radius)
+
+            vertices_on_edge = []
+
+            for idx in candidate_indices:
+                vertex = vertex_array[idx]
+                vertex_tuple = tuple(vertex.astype(int))
+
+                # Skip if this vertex belongs to current building
+                if contour_idx in vertex_to_buildings.get(vertex_tuple, []):
+                    continue
+
+                # Skip if vertex is an endpoint
+                if np.allclose(vertex, v1, atol=0.1) or np.allclose(
+                    vertex, v2, atol=0.1
+                ):
+                    continue
+
+                # Check if vertex lies on edge
+                dist = point_to_segment_distance(vertex, v1, v2)
+                if dist <= tolerance:
+                    t = project_point_onto_segment(vertex, v1, v2)
+                    if 0 < t < 1:
+                        vertices_on_edge.append((t, vertex))
+
+            # Sort and insert
+            vertices_on_edge.sort(key=lambda x: x[0])
+            for t, vertex_to_insert in vertices_on_edge:
+                new_vertices.append(vertex_to_insert)
+                total_insertions += 1
+
+        if len(new_vertices) > 0:
+            subdivided_contour = np.array(
+                [[[int(v[0]), int(v[1])]] for v in new_vertices], dtype=np.int32
+            )
+            subdivided_contours.append(subdivided_contour)
+        else:
+            subdivided_contours.append(contour)
+
+    if total_insertions > 0:
+        print(f"  → Inserted {total_insertions} vertices into edges (optimized)")
+
+    return subdivided_contours
+
+
+def subdivide_edges_with_vertices_old(contours, tolerance=2.0):
+    """
+    OSM Topology Requirement: Insert vertices from adjacent polygons into edges.
+
+    If a vertex from polygon P2 lies on an edge of polygon P1, that edge must be
+    subdivided to include that vertex. This ensures proper topology for OSM.
+
+    Example from the diagram:
+        P1 = <A, B, C, D>
+        P2 = <E, F, G, H>
+
+    If E lies on edge B-C and C lies on edge H-E:
+        P1 becomes <A, B, E, C, D> (E inserted into B-C)
+        P2 becomes <E, F, G, H, C> (C inserted into H-E)
 
     Args:
-        point: Point as numpy array [x, y]
-        seg_start: Segment start as numpy array [x, y]
-        seg_end: Segment end as numpy array [x, y]
+        contours: List of contours (polygons)
+        tolerance: Maximum distance from edge to consider vertex "on" the edge
 
     Returns:
         Minimum distance from point to segment
+        List of contours with subdivided edges
     """
-    # Vector from seg_start to seg_end
-    segment_vec = seg_end - seg_start
-    segment_length_sq = np.dot(segment_vec, segment_vec)
+    # Collect all unique vertices from all polygons
+    all_vertices = set()
+    for contour in contours:
+        for point in contour:
+            all_vertices.add(tuple(point[0]))
+
+    print(f"Checking {len(all_vertices)} vertices against edges for subdivision...")
+
+    subdivided_contours = []
+    total_insertions = 0
+
+    for contour_idx, contour in enumerate(contours):
+        # Start with original vertices
+        new_vertices = []
+
+        # Process each edge of this polygon
+        num_vertices = len(contour)
+        for i in range(num_vertices):
+            # Current edge: from vertex i to vertex i+1 (wrapping around)
+            v1 = np.array(contour[i][0], dtype=float)
+            v2 = np.array(contour[(i + 1) % num_vertices][0], dtype=float)
+
+            # Add the starting vertex of this edge
+            new_vertices.append(v1)
+
+            # Find all vertices from OTHER polygons that lie on this edge
+            vertices_on_edge = []
+
+            for vertex in all_vertices:
+                vertex_array = np.array(vertex, dtype=float)
+
+                # Skip if this vertex is already one of the edge endpoints
+                if np.allclose(vertex_array, v1, atol=0.1) or np.allclose(
+                    vertex_array, v2, atol=0.1
+                ):
+                    continue
+
+                # Check if vertex lies on the line segment v1-v2
+                # Using point-to-line-segment distance
+                distance_to_segment = point_to_segment_distance(vertex_array, v1, v2)
+
+                if distance_to_segment <= tolerance:
+                    # This vertex lies on the edge! Calculate its position along the edge
+                    # for proper ordering
+                    t = project_point_onto_segment(vertex_array, v1, v2)
+                    if 0 < t < 1:  # Only if between v1 and v2, not beyond
+                        vertices_on_edge.append((t, vertex_array))
+                        total_insertions += 1
+
+            # Sort vertices by their position along the edge (parameter t)
+            vertices_on_edge.sort(key=lambda x: x[0])
+
+            # Insert them in order
+            for t, vertex_array in vertices_on_edge:
+                new_vertices.append(vertex_array)
+
+        # Convert back to OpenCV format
+        if len(new_vertices) > 0:
+            new_vertices_array = np.array(new_vertices, dtype=np.int32)
+            new_vertices_array = new_vertices_array.reshape((-1, 1, 2))
+            subdivided_contours.append(new_vertices_array)
+
+    print(f"Total vertices inserted into edges: {total_insertions}")
+    return subdivided_contours
+
+
+def point_to_segment_distance(point, segment_start, segment_end):
+    """Calculate the shortest distance from a point to a line segment."""
+    # Vector from segment_start to segment_end
+    segment_vec = segment_end - segment_start
 
     if segment_length_sq == 0:
         # Degenerate segment (point)
