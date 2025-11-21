@@ -72,7 +72,7 @@ def separate_buildings(alpha, black_borders):
     # riducendo l'erosione della forma quadrata degli edifici.
     kernel = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
 
-    dilated_borders = cv2.dilate(black_borders, kernel, iterations=1)
+    dilated_borders = cv2.dilate(black_borders, kernel, iterations=0)
 
     # Copiamo la maschera degli edifici e impostiamo a 0 (nero) i pixel
     # dove passa il nostro bordo dilatato.
@@ -88,7 +88,7 @@ def separate_buildings(alpha, black_borders):
     binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel_clean, iterations=1)
 
     # Conta le isole separate. Connettività default=8 (include le diagonali).
-    num_labels, markers = cv2.connectedComponents(binary)
+    num_labels, markers = cv2.connectedComponents(binary, connectivity=4)
 
     print(
         f"Found {num_labels - 1} separate building regions after removing dilated borders"
@@ -244,6 +244,7 @@ def snap_contours_to_borders(contours, offset_distance=2.0):
 
     return buffered_contours
 
+
 def subdivide_edges_with_vertices_opt_old(contours, tolerance=2.0):
     """
     OSM edge subdivision (OPTIMIZED with spatial indexing).
@@ -329,6 +330,7 @@ def subdivide_edges_with_vertices_opt_old(contours, tolerance=2.0):
     print(f"  → Inserted {total_insertions} vertices into edges for OSM topology")
 
     return subdivided_contours
+
 
 def subdivide_edges_with_vertices_opt_new(contours, tolerance=2.0):
     """
@@ -441,7 +443,6 @@ def subdivide_edges_with_vertices_old(contours, tolerance=2.0):
         tolerance: Maximum distance from edge to consider vertex "on" the edge
 
     Returns:
-        Minimum distance from point to segment
         List of contours with subdivided edges
     """
     # Collect all unique vertices from all polygons
