@@ -821,57 +821,151 @@ def simplify_polygon(contour, epsilon_factor=3.0):
     return simplified
 
 
-def contours_to_geojson(contours, image_shape):
+def transform_pixel_to_geographic(x, y, image_width, image_height, bbox):
     """
-    Convert contours to GeoJSON FeatureCollection.
-
-    Note: Coordinates are in image pixel space. For actual geographic coordinates,
-    you need to apply a coordinate transform based on your WMS tile parameters.
-
+    Transform pixel coordinates to WGS84 lat/lon.
+    
     Args:
-        contours: List of OpenCV contours
-        image_shape: Shape of the source image (for reference)
-
+        x, y: Pixel coordinates
+        image_width, image_height: Image dimensions
+        bbox: (lat_min, lon_min, lat_max, lon_max)
+    
     Returns:
-        GeoJSON FeatureCollection dict
+        (lon, lat) in WGS84
+    """
+    lat_min, lon_min, lat_max, lon_max = bbox
+    
+    # x maps to longitude
+    lon = lon_min + (x / image_width) * (lon_max - lon_min)
+    
+    # y maps to latitude (inverted: y=0 is top, lat_max is north)
+    lat = lat_max - (y / image_height) * (lat_max - lat_min)
+    
+    return (lon, lat)
+
+
+
+def contours_to_geojson(buildings, image_shape, bbox=None):
+    """
+    Convert building contours (with holes) to GeoJSON format.
+    
+    Args:
+        buildings: List of dicts with 'outer' contour and 'holes' list
+        image_shape: Shape of the image (height, width, channels)
+        bbox: Optional (lat_min, lon_min, lat_max, lon_max) for WGS84 transformation
+    
+    Returns:
+        GeoJSON FeatureCollection with proper coordinates
     """
     features = []
-
-    for i, contour in enumerate(contours):
-        # Convert contour to coordinate list
-        coords = contour.squeeze().tolist()
-
-        # Ensure proper shape (handle single-point edge case)
-        if not isinstance(coords[0], list):
-            coords = [coords]
-
-        # Close the polygon (GeoJSON requires first == last)
-        if coords[0] != coords[-1]:
-            coords.append(coords[0])
-
-        # Create GeoJSON polygon
-        # Note: GeoJSON uses [lon, lat] but we're using [x, y] pixel coords
-        # For actual OSM upload, you need to transform to geographic coordinates
-        geometry = {"type": "Polygon", "coordinates": [coords]}
-
-        # Calculate properties
-        area = cv2.contourArea(contour)
-        perimeter = cv2.arcLength(contour, True)
-
+    
+    image_height, image_width = image_shape[:2]
+    use_geographic = bbox is not None
+    
+    if use_geographic:
+        print(f"Transforming to WGS84 using bbox: {bbox}")
+    
+    for i, building in enumerate(buildings):
+        outer_contour = building['outer']
+        holes = building.get('holes', [])
+        
+        # Calculate area of outer boundary
+        area = cv2.contourArea(outer_contour)
+        if area < 50:  # Skip very small buildings
+            continue
+        
+        # Convert outer contour to coordinates
+        outer_coords = outer_contour.squeeze().tolist()
+        
+        # Ensure it's a valid list
+        if not isinstance(outer_coords, list):
+            continue
+            
+        # Make sure we have enough points
+        if len(outer_coords) < 3:
+            continue
+        
+        # Transform to geographic if bbox provided
+        if use_geographic:
+            outer_coords = [
+                list(transform_pixel_to_geographic(x, y, image_width, image_height, bbox))
+                for x, y in outer_coords
+            ]
+        
+        # Ensure closed polygon
+        if outer_coords[0] != outer_coords[-1]:
+            outer_coords.append(outer_coords[0])
+        
+        # Start with outer ring
+        coordinate_arrays = [outer_coords]
+        
+        # Add holes (inner rings)
+        for hole in holes:
+            hole_coords = hole.squeeze().tolist()
+            
+            # Validate hole
+            if isinstance(hole_coords, list) and len(hole_coords) >= 3:
+                # Transform to geographic if bbox provided
+                if use_geographic:
+                    hole_coords = [
+                        list(transform_pixel_to_geographic(x, y, image_width, image_height, bbox))
+                        for x, y in hole_coords
+                    ]
+                
+                # Ensure closed
+                if hole_coords[0] != hole_coords[-1]:
+                    hole_coords.append(hole_coords[0])
+                
+                coordinate_arrays.append(hole_coords)
+        
+        # Calculate total vertex count (outer + all holes)
+        total_vertices = sum(len(coords) - 1 for coords in coordinate_arrays)
+        
+        # Build properties
+        properties = {
+            "building_id": i,
+            "vertices": total_vertices,
+            "has_holes": len(holes) > 0,
+            "hole_count": len(holes)
+        }
+        
+        # Add area - in pixels or approximate m² if geographic
+        if use_geographic:
+            # Rough approximation for area in m² (more accurate would need proper projection)
+            # At equator: 1 degree ≈ 111km
+            lat_center = (bbox[0] + bbox[2]) / 2
+            meters_per_degree_lat = 111320
+            meters_per_degree_lon = 111320 * np.cos(np.radians(lat_center))
+            
+            lat_span = bbox[2] - bbox[0]
+            lon_span = bbox[3] - bbox[1]
+            
+            meters_height = lat_span * meters_per_degree_lat
+            meters_width = lon_span * meters_per_degree_lon
+            
+            pixel_to_m2 = (meters_width / image_width) * (meters_height / image_height)
+            area_m2 = area * pixel_to_m2
+            
+            properties["area_m2"] = float(area_m2)
+        else:
+            properties["area_pixels"] = float(area)
+        
         feature = {
             "type": "Feature",
-            "geometry": geometry,
-            "properties": {
-                "id": i,
-                "area_pixels": float(area),
-                "perimeter_pixels": float(perimeter),
-                "vertices": len(coords) - 1,  # -1 because first==last
-            },
+            "properties": properties,
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": coordinate_arrays
+            }
         }
-
         features.append(feature)
-
-    return {"type": "FeatureCollection", "features": features}
+    
+    geojson = {
+        "type": "FeatureCollection",
+        "features": features
+    }
+    
+    return geojson
 
 
 def save_debug_images(
@@ -956,6 +1050,9 @@ def process_wms_tile(image_path, output_dir=None, epsilon_factor=3.0, bbox=None)
         epsilon_factor: Polygon simplification tolerance in pixels (default: 3.0)
                        Higher values = simpler polygons with fewer vertices
                        Typical range: 2-5 pixels
+
+        bbox: Optional bounding box as (lat_min, lon_min, lat_max, lon_max) in WGS84
+              If provided, outputs geographic coordinates; otherwise pixel coordinates
     """
     print(f"Processing: {image_path}")
 
@@ -1111,7 +1208,7 @@ def process_wms_tile(image_path, output_dir=None, epsilon_factor=3.0, bbox=None)
     # 7c. OSM TOPOLOGY: Subdivide edges with vertices from adjacent polygons
     # If a vertex from polygon P2 lies on an edge of polygon P1, insert it into that edge.
     # This is CRITICAL for OpenStreetMap compliance.
-    subdivision_tolerance = 5.0  # Maximum distance to consider vertex "on" an edge
+    subdivision_tolerance = 8.0  # Maximum distance to consider vertex "on" an edge
     snapped_contours = subdivide_edges_with_vertices_opt_new(
         snapped_contours, tolerance=subdivision_tolerance
     )
@@ -1146,7 +1243,6 @@ def process_wms_tile(image_path, output_dir=None, epsilon_factor=3.0, bbox=None)
     final_viz[black_borders > 0] = [128, 128, 128]
     cv2.imwrite(str(debug_dir / "07_final_OSM_topology.png"), final_viz)
     print(f"Saved: 07_final_OSM_topology.png")
-
     print(f"Final polygon count: {len(snapped_contours)}")
 
     snapped_img = cv2.cvtColor(alpha, cv2.COLOR_GRAY2BGR)
@@ -1171,61 +1267,85 @@ def process_wms_tile(image_path, output_dir=None, epsilon_factor=3.0, bbox=None)
      # 9. Convert to GeoJSON (buildings with holes)
     geojson = contours_to_geojson(buildings_final, img.shape, bbox=bbox)
 
-    # 9. Save GeoJSON
+    # 10. Save GeoJSON
     output_json = output_dir / "buildings.geojson"
-    with open(output_json, "w") as f:
+    with open(output_json, 'w') as f:
         json.dump(geojson, f, indent=2)
-
+    
     print(f"\nResults:")
     print(f"  - Buildings extracted: {len(geojson['features'])}")
     print(f"  - GeoJSON saved to: {output_json}")
     print(f"  - Debug images in: {debug_dir}")
-
+    
     # Print summary statistics
-    if geojson["features"]:
-        vertices = [f["properties"]["vertices"] for f in geojson["features"]]
-        areas = [f["properties"]["area_pixels"] for f in geojson["features"]]
+    if geojson['features']:
+        vertices = [f['properties']['vertices'] for f in geojson['features']]
+        
+        # Check if we have geographic or pixel coordinates
+        if bbox is not None:
+            areas = [f['properties']['area_m2'] for f in geojson['features']]
+            area_unit = "m²"
+        else:
+            areas = [f['properties']['area_pixels'] for f in geojson['features']]
+            area_unit = "pixels²"
+        
         print(f"\nStatistics:")
         print(f"  - Avg vertices per building: {np.mean(vertices):.1f}")
         print(f"  - Min/Max vertices: {min(vertices)}/{max(vertices)}")
-        print(f"  - Avg area: {np.mean(areas):.1f} pixels²")
-
+        print(f"  - Avg area: {np.mean(areas):.1f} {area_unit}")
+        
+        if bbox is not None:
+            print(f"  - Coordinates: WGS84 (lat/lon)")
+        else:
+            print(f"  - Coordinates: Pixel (image space)")
+    
     return geojson
 
 
 def main():
+    print("aaaaaaaa")
     if len(sys.argv) < 2:
-        print(
-            "Usage: python extract_buildings_optimized.py <image_path> [output_dir] [epsilon]"
-        )
+        print("Usage: python extract_buildings.py <image_path> [output_dir] [epsilon] [bbox]")
         print("\nArguments:")
         print("  image_path     - Path to input PNG image (required)")
         print("  output_dir     - Output directory (optional, default: ./output)")
-        print(
-            "  epsilon        - Polygon simplification in pixels (optional, default: 3)"
-        )
+        print("  epsilon        - Polygon simplification in pixels (optional, default: 3)")
         print("                   Higher values = simpler polygons (fewer vertices)")
         print("                   Recommended: 2-5 pixels for building corners")
-        print("\nExample:")
-        print("  python extract_buildings_optimized.py tile.png")
-        print("  python extract_buildings_optimized.py tile.png ./results 4")
-        print("\nOPTIMIZATION:")
-        print("  This version uses geometric buffering instead of pixel search,")
-        print("  providing ~10,000× speedup for typical building extraction tasks.")
+        print("  bbox           - Bounding box as 'lat_min,lon_min,lat_max,lon_max' (optional)")
+        print("                   Format: South,West,North,East in WGS84 (EPSG:4326)")
+        print("                   If provided, outputs geographic coordinates")
+        print("\nExamples:")
+        print("  python extract_buildings.py tile.png")
+        print("  python extract_buildings.py tile.png ./results 4")
+		
+        print("  python extract_buildings.py tile.png ./results 5 '41.890,12.492,41.893,12.495'")
         sys.exit(1)
-
+    
     image_path = sys.argv[1]
     output_dir = sys.argv[2] if len(sys.argv) > 2 else None
-    epsilon_factor = (
-        float(sys.argv[3]) if len(sys.argv) > 3 else 3.0
-    )  # 3 pixels default
-
+    epsilon_factor = 3.0
+    
+    # Parse bbox if provided
+    bbox = None
+    if len(sys.argv) > 4:
+        try:
+            bbox_str = sys.argv[4]
+            bbox_parts = [float(x.strip()) for x in bbox_str.split(',')]
+            if len(bbox_parts) != 4:
+                raise ValueError("bbox must have exactly 4 values")
+            bbox = tuple(bbox_parts)
+            print(f"Using bounding box: lat_min={bbox[0]}, lon_min={bbox[1]}, lat_max={bbox[2]}, lon_max={bbox[3]}")
+        except Exception as e:
+            print(f"Error parsing bbox: {e}")
+            print("bbox format: 'lat_min,lon_min,lat_max,lon_max'")
+            sys.exit(1)
+    
     try:
-        process_wms_tile(image_path, output_dir, epsilon_factor)
+        process_wms_tile(image_path, output_dir, epsilon_factor, bbox=bbox)
     except Exception as e:
         print(f"Error: {e}")
         import traceback
-
         traceback.print_exc()
         sys.exit(1)
 
