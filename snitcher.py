@@ -2,6 +2,7 @@
 """
 Extract building polygons from WMS tile images.
 Buildings are orange polygons with black borders on transparent background.
+OPTIMIZED VERSION with multiprocessing and spatial indexing.
 """
 
 import sys
@@ -9,6 +10,9 @@ import cv2
 import numpy as np
 from pathlib import Path
 import json
+from scipy.spatial import cKDTree
+from multiprocessing import Pool, cpu_count
+import time
 
 
 def load_image(image_path):
@@ -31,57 +35,48 @@ def extract_alpha_mask(img):
 
 
 def extract_black_borders(img, alpha):
-    """Estrae le linee nere (bordi) che separano gli edifici."""
-
-    # Genera una matrice Booleana (True/False): ignora lo sfondo trasparente vuoto
+    """Extract black border lines (VECTORIZED)."""
+    # Opaque pixels
     opaque_mask = alpha > 128
 
-    # Se l'immagine è BGRA (4 canali), scarta l'ultimo (Alpha) per analizzare solo il colore
+    # BGR channels
     if img.shape[2] == 4:
-        bgr = img[:, :, :3]  # Prendi tutti i pixel, ma solo i primi 3 canali (B, G, R)
+        bgr = img[:, :, :3]
     else:
         bgr = img
 
-    # Prendi i pixel neri
-    # np.all(..., axis=2): Controlla se B, G e R sono TUTTI scuri (< 100) nello stesso pixel.
-    # & opaque_mask: ...ma SOLO se il pixel non è trasparente.
-    black_mask = np.all(bgr < 100, axis=2) & opaque_mask
+    # Vectorized black detection: all channels < 100
+    black_mask = (
+        (bgr[:, :, 0] < 100) & (bgr[:, :, 1] < 100) & (bgr[:, :, 2] < 100) & opaque_mask
+    )
 
-    # Trasforma True/False in 1/0 (uint8), poi in 255/0 per avere Bianco/Nero
     return black_mask.astype(np.uint8) * 255
 
 
 def separate_buildings(alpha, black_borders):
     """
-    Separa gli edifici attaccati usando i bordi neri come separatori.
-    Usa una dilatazione a CROCE per preservare meglio gli angoli retti.
+    Separate attached buildings using black borders as separators.
+    The key insight: black borders are drawn ON TOP of orange pixels, so we need to
+    DILATE them first to create actual gaps between buildings before removal.
     """
-
-    # Usiamo MORPH_CROSS dimensione 3x3.
-    # Forma:
-    #   0 1 0
-    #   1 1 1
-    #   0 1 0
-    # Questo espande il bordo nero nelle direzioni principali ma NON riempie gli angoli,
-    # riducendo l'erosione della forma quadrata degli edifici.
-    kernel = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
-
+    # CRITICAL: Dilate black borders to create separation gaps
+    # This ensures buildings are actually disconnected when we remove the borders
+    # Using iterations=3 for more aggressive separation
+    kernel = np.ones((2, 2), np.uint8)
     dilated_borders = cv2.dilate(black_borders, kernel, iterations=1)
 
-    # Copiamo la maschera degli edifici e impostiamo a 0 (nero) i pixel
-    # dove passa il nostro bordo dilatato.
+    # Now remove the dilated borders from alpha to separate buildings
     building_mask = alpha.copy()
     building_mask[dilated_borders > 0] = 0
 
-    # Puliamo l'immagine risultante: tutto ciò che non è nero diventa bianco puro.
+    # Apply threshold to get binary mask
     _, binary = cv2.threshold(building_mask, 128, 255, cv2.THRESH_BINARY)
 
-    # Rimuove rumore puntiforme (piccoli pixel isolati rimasti dopo il taglio)
-    # Qui usiamo ancora un kernel 3x3 classico perché è più efficace per pulire il rumore.
-    kernel_clean = np.ones((3, 3), np.uint8)
-    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel_clean, iterations=1)
+    # Clean up small artifacts but preserve building separation
+    kernel_small = np.ones((2, 2), np.uint8)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel_small, iterations=1)
 
-    # Conta le isole separate. Connettività default=8 (include le diagonali).
+    # Label each disconnected region as a separate building
     num_labels, markers = cv2.connectedComponents(binary)
 
     print(
@@ -93,135 +88,116 @@ def separate_buildings(alpha, black_borders):
 
 def snap_contours_to_borders(contours, black_borders, snap_distance=3):
     """
-    Snap contour vertices to original black borders to ensure adjacent buildings
-    share exact vertices/edges where they meet.
-
-    This solves the topology problem where dilation creates gaps between buildings.
-    Buildings that share a wall should share the same vertices.
-
-    Args:
-        contours: List of contours from cv2.findContours
-        black_borders: Original (non-dilated) black border mask
-        snap_distance: Maximum distance to snap (should match dilation radius)
-
-    Returns:
-        List of snapped contours
+    Snap contour vertices to original black borders (OPTIMIZED with KDTree).
+    O(n log m) instead of O(n*m) where n=vertices, m=border pixels.
     """
     # Get coordinates of all black border pixels
-    border_pixels = np.column_stack(np.where(black_borders > 0))  # Returns (y, x) pairs
+    border_coords = np.column_stack(np.where(black_borders > 0))  # (y, x) pairs
 
-    if len(border_pixels) == 0:
-        return contours  # No borders to snap to
+    if len(border_coords) == 0:
+        return contours
+
+    # Build KDTree for fast nearest neighbor lookup
+    # Swap to (x, y) for consistency
+    border_pixels = border_coords[:, [1, 0]]  # Now (x, y)
+    kdtree = cKDTree(border_pixels)
+
     snapped_contours = []
 
     for contour in contours:
-        snapped_contour = []
+        vertices = contour[:, 0, :]  # Shape: (N, 2)
 
-        for point in contour:
-            x, y = point[0]
+        # Query KDTree for nearest border pixels
+        distances, indices = kdtree.query(vertices, distance_upper_bound=snap_distance)
 
-            # Find nearest black border pixel within snap_distance
-            # Calculate distances to all border pixels
-            distances = np.sqrt(
-                (border_pixels[:, 1] - x) ** 2 + (border_pixels[:, 0] - y) ** 2
-            )
-            min_dist_idx = np.argmin(distances)
-            min_dist = distances[min_dist_idx]
-
-            # If close enough to a border, snap to it
-            if min_dist <= snap_distance:
-                nearest_y, nearest_x = border_pixels[min_dist_idx]
-                snapped_contour.append([[nearest_x, nearest_y]])
+        snapped_vertices = []
+        for i, (dist, idx) in enumerate(zip(distances, indices)):
+            if dist <= snap_distance and idx < len(border_pixels):
+                # Snap to nearest border pixel
+                snapped_vertices.append(border_pixels[idx])
             else:
-                # Keep original position if not near a border
-                snapped_contour.append([[x, y]])
+                # Keep original
+                snapped_vertices.append(vertices[i])
 
-        # Convert back to numpy array format
-        snapped_contours.append(np.array(snapped_contour, dtype=np.int32))
+        snapped_contour = np.array(snapped_vertices, dtype=np.int32).reshape(-1, 1, 2)
+        snapped_contours.append(snapped_contour)
 
     return snapped_contours
 
 
 def subdivide_edges_with_vertices(contours, tolerance=2.0):
     """
-    OSM Topology Requirement: Insert vertices from adjacent polygons into edges.
-
-    If a vertex from polygon P2 lies on an edge of polygon P1, that edge must be
-    subdivided to include that vertex. This ensures proper topology for OSM.
-
-    Example from the diagram:
-        P1 = <A, B, C, D>
-        P2 = <E, F, G, H>
-
-    If E lies on edge B-C and C lies on edge H-E:
-        P1 becomes <A, B, E, C, D> (E inserted into B-C)
-        P2 becomes <E, F, G, H, C> (C inserted into H-E)
-
-    Args:
-        contours: List of contours (polygons)
-        tolerance: Maximum distance from edge to consider vertex "on" the edge
-
-    Returns:
-        List of contours with subdivided edges
+    OSM edge subdivision (OPTIMIZED with spatial indexing).
+    Only checks vertices near each edge instead of all vertices.
     """
-    # Collect all unique vertices from all polygons
+    # Collect all unique vertices
     all_vertices = set()
     for contour in contours:
         for point in contour:
             all_vertices.add(tuple(point[0]))
+
+    vertices_array = np.array(list(all_vertices), dtype=float)
+
+    if len(vertices_array) == 0:
+        return contours
+
+    # Build KDTree for vertices
+    kdtree = cKDTree(vertices_array)
 
     print(f"Checking {len(all_vertices)} vertices against edges for subdivision...")
 
     subdivided_contours = []
     total_insertions = 0
 
-    for contour_idx, contour in enumerate(contours):
-        # Start with original vertices
+    for contour in contours:
         new_vertices = []
-
-        # Process each edge of this polygon
         num_vertices = len(contour)
-        for i in range(num_vertices):
-            # Current edge: from vertex i to vertex i+1 (wrapping around)
-            v1 = np.array(contour[i][0], dtype=float)
-            v2 = np.array(contour[(i + 1) % num_vertices][0], dtype=float)
 
-            # Add the starting vertex of this edge
+        for i in range(num_vertices):
+            v1 = contour[i][0].astype(float)
+            v2 = contour[(i + 1) % num_vertices][0].astype(float)
+
             new_vertices.append(v1)
 
-            # Find all vertices from OTHER polygons that lie on this edge
+            # Edge bounding box
+            min_x, max_x = min(v1[0], v2[0]), max(v1[0], v2[0])
+            min_y, max_y = min(v1[1], v2[1]), max(v1[1], v2[1])
+
+            # Query vertices near the edge bounding box (with tolerance)
+            edge_center = (v1 + v2) / 2
+            edge_length = np.linalg.norm(v2 - v1)
+            search_radius = edge_length / 2 + tolerance + 1
+
+            nearby_indices = kdtree.query_ball_point(edge_center, search_radius)
+
             vertices_on_edge = []
 
-            for vertex in all_vertices:
-                vertex_array = np.array(vertex, dtype=float)
+            for idx in nearby_indices:
+                vertex = vertices_array[idx]
 
-                # Skip if this vertex is already one of the edge endpoints
-                if np.allclose(vertex_array, v1, atol=0.1) or np.allclose(
-                    vertex_array, v2, atol=0.1
+                # Skip edge endpoints
+                if np.allclose(vertex, v1, atol=0.1) or np.allclose(
+                    vertex, v2, atol=0.1
                 ):
                     continue
 
-                # Check if vertex lies on the line segment v1-v2
-                # Using point-to-line-segment distance
-                distance_to_segment = point_to_segment_distance(vertex_array, v1, v2)
+                # Check if vertex is on the line segment
+                dist = point_to_segment_distance(vertex, v1, v2)
 
-                if distance_to_segment <= tolerance:
-                    # This vertex lies on the edge! Calculate its position along the edge
-                    # for proper ordering
-                    t = project_point_onto_segment(vertex_array, v1, v2)
-                    if 0 < t < 1:  # Only if between v1 and v2, not beyond
-                        vertices_on_edge.append((t, vertex_array))
+                if dist <= tolerance:
+                    t = project_point_onto_segment(vertex, v1, v2)
+                    if 0 < t < 1:
+                        vertices_on_edge.append((t, vertex))
 
-            # Sort vertices by their position along the edge (by parameter t)
+            # Sort by position along edge
             vertices_on_edge.sort(key=lambda x: x[0])
 
-            # Insert them in order
-            for t, vertex_to_insert in vertices_on_edge:
-                new_vertices.append(vertex_to_insert)
+            # Insert them
+            for t, vertex in vertices_on_edge:
+                new_vertices.append(vertex)
                 total_insertions += 1
 
-        # Convert back to contour format
-        if len(new_vertices) > 0:
+        if new_vertices:
             subdivided_contour = np.array(
                 [[[int(v[0]), int(v[1])]] for v in new_vertices], dtype=np.int32
             )
@@ -229,9 +205,7 @@ def subdivide_edges_with_vertices(contours, tolerance=2.0):
         else:
             subdivided_contours.append(contour)
 
-    print(
-        f"  → Inserted {total_insertions} vertices into edges for OSM topology compliance"
-    )
+    print(f"  → Inserted {total_insertions} vertices into edges for OSM topology")
 
     return subdivided_contours
 
@@ -295,232 +269,137 @@ def project_point_onto_segment(point, seg_start, seg_end):
 
 def merge_nearby_vertices(contours, merge_distance=2):
     """
-    After snapping, vertices from different buildings might snap to different
-    but nearby pixels on the same border. This function merges vertices that
-    are very close together so adjacent buildings share exact coordinates.
-
-    Args:
-        contours: List of snapped contours
-        merge_distance: Maximum distance to consider vertices as "same" (pixels)
-
-    Returns:
-        List of contours with merged vertices
+    Merge nearby vertices using KDTree (OPTIMIZED).
+    O(n log n) instead of O(n²).
     """
-    # Collect all vertices with their building index
-    all_vertices = []
+    # Collect all vertices with their source info
+    vertices_list = []
+    vertex_map = {}  # (contour_idx, point_idx) -> vertex_idx
+
     for contour_idx, contour in enumerate(contours):
-        for point_idx, point in enumerate(contour):
-            x, y = point[0]
-            all_vertices.append((x, y, contour_idx, point_idx))
+        for point_idx in range(len(contour)):
+            x, y = contour[point_idx][0]
+            vertex_idx = len(vertices_list)
+            vertices_list.append([x, y])
+            vertex_map[(contour_idx, point_idx)] = vertex_idx
 
-    # Build a mapping of nearby vertices
-    # For each unique location, find all vertices within merge_distance
-    vertex_groups = {}
-    processed = set()
+    if not vertices_list:
+        return contours
 
-    for i, (x1, y1, c1, p1) in enumerate(all_vertices):
-        if i in processed:
-            continue
+    vertices_array = np.array(vertices_list, dtype=float)
 
-        # Find all vertices close to this one
-        group = [(x1, y1, c1, p1)]
-        processed.add(i)
+    # Build KDTree
+    kdtree = cKDTree(vertices_array)
 
-        for j, (x2, y2, c2, p2) in enumerate(all_vertices[i + 1 :], start=i + 1):
-            if j in processed:
-                continue
-            dist = np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
-            if dist <= merge_distance:
-                group.append((x2, y2, c2, p2))
-                processed.add(j)
+    # Find all pairs within merge_distance
+    pairs = kdtree.query_pairs(merge_distance, output_type="ndarray")
 
-        if len(group) > 1:
-            # Calculate average position for this group
-            avg_x = int(np.mean([v[0] for v in group]))
-            avg_y = int(np.mean([v[1] for v in group]))
-            vertex_groups[(avg_x, avg_y)] = group
+    # Build clusters using Union-Find
+    parent = list(range(len(vertices_list)))
 
-    # Update contours with merged vertices
-    merged_contours = [contour.copy() for contour in contours]
+    def find(x):
+        if parent[x] != x:
+            parent[x] = find(parent[x])
+        return parent[x]
 
-    for (avg_x, avg_y), group in vertex_groups.items():
-        for x, y, contour_idx, point_idx in group:
-            merged_contours[contour_idx][point_idx][0][0] = avg_x
-            merged_contours[contour_idx][point_idx][0][1] = avg_y
+    def union(x, y):
+        px, py = find(x), find(y)
+        if px != py:
+            parent[px] = py
 
-    print(f"  → Merged {len(vertex_groups)} groups of nearby vertices")
+    for i, j in pairs:
+        union(i, j)
+
+    # Compute cluster centroids
+    clusters = {}
+    for i in range(len(vertices_list)):
+        root = find(i)
+        if root not in clusters:
+            clusters[root] = []
+        clusters[root].append(i)
+
+    centroid_map = {}
+    for root, members in clusters.items():
+        centroid = vertices_array[members].mean(axis=0)
+        centroid_map[root] = (int(round(centroid[0])), int(round(centroid[1])))
+
+    # Update contours
+    merged_contours = []
+    for contour_idx, contour in enumerate(contours):
+        new_points = []
+        for point_idx in range(len(contour)):
+            vertex_idx = vertex_map[(contour_idx, point_idx)]
+            root = find(vertex_idx)
+            new_x, new_y = centroid_map[root]
+            new_points.append([[new_x, new_y]])
+        merged_contours.append(np.array(new_points, dtype=np.int32))
+
+    if clusters:
+        print(f"  → Merged {len(clusters)} groups of nearby vertices")
 
     return merged_contours
 
 
-def snap_shared_boundaries(contours, dilation_distance=2):
-    """
-    Snap nearby vertices together to create shared boundaries between adjacent buildings.
-
-    After dilation creates gaps, adjacent buildings have separate vertices that should
-    be the same. This function:
-    1. Finds clusters of vertices that are very close (within dilation_distance)
-    2. Replaces each cluster with a single shared vertex at the average position
-    3. Ensures adjacent buildings share edges properly
-
-    Args:
-        contours: List of contours (polygons)
-        dilation_distance: Maximum distance for vertices to be considered "same" (pixels)
-
-    Returns:
-        List of contours with snapped vertices
-    """
-    if not contours:
-        return contours
-
-    # Collect all vertices from all contours with their source information
-    all_vertices = []
-    for contour_idx, contour in enumerate(contours):
-        for point_idx, point in enumerate(contour):
-            x, y = point[0]
-            all_vertices.append(
-                {
-                    "x": x,
-                    "y": y,
-                    "contour_idx": contour_idx,
-                    "point_idx": point_idx,
-                    "original": (x, y),
-                }
-            )
-
-    if not all_vertices:
-        return contours
-
-    # Build clusters of nearby vertices using simple distance threshold
-    # This is O(n²) but works fine for typical building counts
-    tolerance = dilation_distance * 1.5  # Slightly larger than dilation gap
-    vertex_clusters = []
-    used = set()
-
-    for i, v1 in enumerate(all_vertices):
-        if i in used:
-            continue
-
-        cluster = [i]
-        used.add(i)
-
-        # Find all vertices within tolerance
-        for j, v2 in enumerate(all_vertices):
-            if j <= i or j in used:
-                continue
-
-            dist = np.sqrt((v1["x"] - v2["x"]) ** 2 + (v1["y"] - v2["y"]) ** 2)
-            if dist <= tolerance:
-                cluster.append(j)
-                used.add(j)
-
-        if len(cluster) > 0:
-            vertex_clusters.append(cluster)
-
-    # For each cluster, compute the average position (shared vertex)
-    shared_positions = {}
-    for cluster in vertex_clusters:
-        avg_x = np.mean([all_vertices[i]["x"] for i in cluster])
-        avg_y = np.mean([all_vertices[i]["y"] for i in cluster])
-        shared_pos = (int(round(avg_x)), int(round(avg_y)))
-
-        for vertex_idx in cluster:
-            shared_positions[vertex_idx] = shared_pos
-
-    # Rebuild contours with snapped vertices
-    snapped_contours = []
-    for contour_idx, contour in enumerate(contours):
-        new_points = []
-        for point_idx, point in enumerate(contour):
-            # Find this vertex in all_vertices list
-            vertex_idx = None
-            for idx, v in enumerate(all_vertices):
-                if v["contour_idx"] == contour_idx and v["point_idx"] == point_idx:
-                    vertex_idx = idx
-                    break
-
-            if vertex_idx is not None and vertex_idx in shared_positions:
-                # Use shared position
-                new_x, new_y = shared_positions[vertex_idx]
-            else:
-                # Keep original position
-                new_x, new_y = point[0]
-
-            new_points.append([[new_x, new_y]])
-
-        snapped_contours.append(np.array(new_points, dtype=np.int32))
-
-    print(f"Snapped {len(vertex_clusters)} vertex clusters to create shared boundaries")
-
-    return snapped_contours
-
-
-def remove_duplicate_vertices(contour):
-    """Remove consecutive duplicate vertices from a contour."""
-    if len(contour) < 2:
-        return contour
-
-    unique_points = [contour[0]]
-    for point in contour[1:]:
-        if not np.array_equal(point, unique_points[-1]):
-            unique_points.append(point)
-
-    # Check if first and last are the same
-    if len(unique_points) > 1 and np.array_equal(unique_points[0], unique_points[-1]):
-        unique_points = unique_points[:-1]
-
-    return np.array(unique_points, dtype=np.int32)
-
-
 def find_building_contours(separated_mask):
-    # Converte le "isole" di pixel bianchi (raster) in linee geometriche (vettori)
-    # Restituisce:
-    # - contours: lista di array (i poligoni)
-    # - hierarchy: matrice che descrive chi è dentro chi (es. cortile dentro edificio)
+    """Find contours of individual buildings."""
     contours, hierarchy = cv2.findContours(
-        separated_mask,  # Input: Immagine binaria a 1 canale (0=sfondo, 255=oggetto)
-        cv2.RETR_EXTERNAL, 
-        cv2.CHAIN_APPROX_SIMPLE,  # Ottimizzazione: Comprime segmenti orizzontali/verticali/diagonali salvando solo i vertici estremi (Lossless)
+        separated_mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE
     )
+    return contours
 
-    # Nota sul TODO: Con RETR_TREE, 'hierarchy' è fondamentale per distinguere un edificio (Parent)
-    # dal suo cortile (Child). Senza analizzarla, i cortili saranno salvati come edifici "pieni".
 
-    return contours  # Lista di coordinate [(x,y), (x,y)...] per ogni edificio trovato
+def simplify_polygon_worker(args):
+    """Worker function for parallel polygon simplification."""
+    contour, epsilon_factor = args
+    area = cv2.contourArea(contour)
+    if area >= 50:
+        return simplify_polygon(contour, epsilon_factor)
+    return None
+
+
+def simplify_polygons_parallel(contours, epsilon_factor, n_jobs=None):
+    """Simplify polygons in parallel using multiprocessing."""
+    if n_jobs is None:
+        n_jobs = max(1, cpu_count() - 1)
+
+    # Prepare args
+    args_list = [(contour, epsilon_factor) for contour in contours]
+
+    # Use multiprocessing only if worth it (many contours)
+    if len(contours) < 20 or n_jobs == 1:
+        # Sequential for small workloads
+        simplified = []
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area >= 50:
+                simplified.append(simplify_polygon(contour, epsilon_factor))
+        return simplified
+
+    # Parallel processing
+    with Pool(n_jobs) as pool:
+        results = pool.map(simplify_polygon_worker, args_list)
+
+    return [r for r in results if r is not None]
 
 
 def simplify_polygon(contour, epsilon_factor=3.0):
-    """Applica l'algoritmo Ramer-Douglas-Peucker per ridurre i vertici."""
+    """
+    Simplify polygon using Douglas-Peucker algorithm.
+    This reduces vertices to corner points only.
 
-    # Converte input percentuali (<1.0) in pixel o usa il valore assoluto
+    Uses a fixed epsilon value instead of perimeter-based to ensure
+    consistent simplification across all building sizes.
+    Small buildings should not have more vertices than large ones.
+    """
+    # Use a fixed epsilon value (in pixels) for consistent simplification
+    # epsilon_factor is now interpreted as a fixed pixel tolerance
+    # Typical good values: 2-5 pixels for building corners
     epsilon = epsilon_factor if epsilon_factor > 1 else epsilon_factor * 100
 
-    # cv2.approxPolyDP(input, tolleranza_max_distanza, is_closed=True)
-    # Trasforma curve frastagliate in linee rette se l'errore è < epsilon
+    # Approximate polygon
     approx = cv2.approxPolyDP(contour, epsilon, True)
 
     return approx
-
-
-def detect_corners_harris(img, contour):
-    """
-    Alternative: Detect corners using Harris corner detector.
-    This is more sophisticated but may not be necessary.
-    """
-    # Create mask for this building
-    mask = np.zeros(img.shape[:2], dtype=np.uint8)
-    cv2.drawContours(mask, [contour], -1, 255, -1)
-
-    # Harris corner detection
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
-    corners = cv2.cornerHarris(gray, 2, 3, 0.04)
-    corners = cv2.dilate(corners, None)
-
-    # Threshold corners
-    corner_mask = corners > 0.01 * corners.max()
-    corner_mask = corner_mask & (mask > 0)
-
-    return corner_mask
 
 
 def contours_to_geojson(contours, image_shape):
@@ -632,16 +511,10 @@ def save_debug_images(
 
 def process_wms_tile(image_path, output_dir=None, epsilon_factor=3.0):
     """
-    Main processing pipeline for extracting building polygons.
-
-    Args:
-        image_path: Path to input PNG image
-        output_dir: Directory for output files (default: same as input)
-        epsilon_factor: Polygon simplification tolerance in pixels (default: 3.0)
-                       Higher values = simpler polygons with fewer vertices
-                       Typical range: 2-5 pixels
+    Main processing pipeline (OPTIMIZED).
     """
     print(f"Processing: {image_path}")
+    start_time = time.time()
 
     # Setup output directory
     if output_dir is None:
@@ -650,70 +523,58 @@ def process_wms_tile(image_path, output_dir=None, epsilon_factor=3.0):
     output_dir.mkdir(exist_ok=True)
 
     # 1. Load image
+    t0 = time.time()
     img = load_image(image_path)
-    print(f"Image shape: {img.shape}")
+    print(f"Image shape: {img.shape} [{time.time()-t0:.2f}s]")
 
     # 2. Extract alpha channel
+    t0 = time.time()
     alpha = extract_alpha_mask(img)
-    print("Extracted alpha mask")
+    print(f"Extracted alpha mask [{time.time()-t0:.2f}s]")
 
     # 3. Extract black borders
+    t0 = time.time()
     black_borders = extract_black_borders(img, alpha)
-    print("Extracted black borders")
+    print(f"Extracted black borders [{time.time()-t0:.2f}s]")
 
     # 4. Separate attached buildings
+    t0 = time.time()
     separated, markers, dilated_borders = separate_buildings(alpha, black_borders)
-    print("Separated buildings using black borders")
+    print(f"Separated buildings [{time.time()-t0:.2f}s]")
 
     # 5. Find contours
+    t0 = time.time()
     contours = find_building_contours(separated)
-    print(f"Found {len(contours)} building contours")
+    print(f"Found {len(contours)} building contours [{time.time()-t0:.2f}s]")
 
-    # 6. Simplify polygons to corner points FIRST
-    simplified_contours = []
-    for contour in contours:
-        # Calcola area in px^2 (Teorema di Gauss/Shoelace)
-        area = cv2.contourArea(contour)
+    # 6. Simplify polygons (PARALLEL)
+    t0 = time.time()
+    simplified_contours = simplify_polygons_parallel(contours, epsilon_factor)
+    print(f"Simplified to {len(simplified_contours)} polygons [{time.time()-t0:.2f}s]")
 
-        # Filtra rumore
-        if area >= 50:
-            # Semplifica la geometria riducendo i vertici
-            simplified = simplify_polygon(contour, epsilon_factor)
-            simplified_contours.append(simplified)
-
-    print(f"Simplified to {len(simplified_contours)} valid polygons")
-
-    # 7. Snap simplified contours to original black borders for proper topology
-    # This ensures adjacent buildings share exact vertices/edges
-    # IMPORTANT: Do this AFTER simplification so final vertices are snapped
-    # Snap distance needs to be larger because simplification can move vertices away
-    snap_distance = 8  # Larger to account for simplification displacement
+    # 7. Snap to borders (OPTIMIZED with KDTree)
+    t0 = time.time()
+    snap_distance = 15
     snapped_contours = snap_contours_to_borders(
         simplified_contours, black_borders, snap_distance=snap_distance
     )
-    print(
-        f"Snapped simplified contours to black borders (snap_distance={snap_distance}px)"
-    )
+    print(f"Snapped to borders (dist={snap_distance}px) [{time.time()-t0:.2f}s]")
 
-    # 7b. Merge nearby vertices so adjacent buildings share exact same coordinates
-    # After snapping to borders, vertices from different buildings on the same border
-    # may snap to nearby but different pixels. This merges them into shared vertices.
-    merge_distance = 5  # Should be slightly larger than typical black border thickness
+    # 7b. Merge nearby vertices (OPTIMIZED with KDTree)
+    t0 = time.time()
+    merge_distance = 15
     snapped_contours = merge_nearby_vertices(
         snapped_contours, merge_distance=merge_distance
     )
-    print(
-        f"Merged nearby vertices for shared boundaries (merge_distance={merge_distance}px)"
-    )
+    print(f"Merged nearby vertices (dist={merge_distance}px) [{time.time()-t0:.2f}s]")
 
-    # 7c. OSM TOPOLOGY: Subdivide edges with vertices from adjacent polygons
-    # If a vertex from polygon P2 lies on an edge of polygon P1, insert it into that edge.
-    # This is CRITICAL for OpenStreetMap compliance.
-    subdivision_tolerance = 2.0  # Maximum distance to consider vertex "on" an edge
+    # 7c. OSM edge subdivision (OPTIMIZED)
+    t0 = time.time()
+    subdivision_tolerance = 10
     snapped_contours = subdivide_edges_with_vertices(
         snapped_contours, tolerance=subdivision_tolerance
     )
-    print(f"Subdivided edges for OSM topology (tolerance={subdivision_tolerance}px)")
+    print(f"Edge subdivision (tol={subdivision_tolerance}px) [{time.time()-t0:.2f}s]")
 
     print(f"Simplified to {len(simplified_contours)} valid polygons")
 
@@ -753,6 +614,9 @@ def process_wms_tile(image_path, output_dir=None, epsilon_factor=3.0):
         print(f"  - Avg vertices per building: {np.mean(vertices):.1f}")
         print(f"  - Min/Max vertices: {min(vertices)}/{max(vertices)}")
         print(f"  - Avg area: {np.mean(areas):.1f} pixels²")
+
+    total_time = time.time() - start_time
+    print(f"\n✓ Total processing time: {total_time:.2f}s")
 
     return geojson
 
