@@ -31,47 +31,57 @@ def extract_alpha_mask(img):
 
 
 def extract_black_borders(img, alpha):
-    """Extract black border lines that separate buildings."""
-    # Create a mask of pixels that are opaque
+    """Estrae le linee nere (bordi) che separano gli edifici."""
+
+    # Genera una matrice Booleana (True/False): ignora lo sfondo trasparente vuoto
     opaque_mask = alpha > 128
 
-    # Convert to BGR if needed
+    # Se l'immagine è BGRA (4 canali), scarta l'ultimo (Alpha) per analizzare solo il colore
     if img.shape[2] == 4:
-        bgr = img[:, :, :3]
+        bgr = img[:, :, :3]  # Prendi tutti i pixel, ma solo i primi 3 canali (B, G, R)
     else:
         bgr = img
 
-    # Detect black pixels (borders) in opaque areas
-    # Black is low values in all channels
+    # Prendi i pixel neri
+    # np.all(..., axis=2): Controlla se B, G e R sono TUTTI scuri (< 100) nello stesso pixel.
+    # & opaque_mask: ...ma SOLO se il pixel non è trasparente.
     black_mask = np.all(bgr < 100, axis=2) & opaque_mask
 
+    # Trasforma True/False in 1/0 (uint8), poi in 255/0 per avere Bianco/Nero
     return black_mask.astype(np.uint8) * 255
 
 
 def separate_buildings(alpha, black_borders):
     """
-    Separate attached buildings using black borders as separators.
-    The key insight: black borders are drawn ON TOP of orange pixels, so we need to
-    DILATE them first to create actual gaps between buildings before removal.
+    Separa gli edifici attaccati usando i bordi neri come separatori.
+    Usa una dilatazione a CROCE per preservare meglio gli angoli retti.
     """
-    # CRITICAL: Dilate black borders to create separation gaps
-    # This ensures buildings are actually disconnected when we remove the borders
-    # Using iterations=3 for more aggressive separation
-    kernel = np.ones((2, 2), np.uint8)
+
+    # Usiamo MORPH_CROSS dimensione 3x3.
+    # Forma:
+    #   0 1 0
+    #   1 1 1
+    #   0 1 0
+    # Questo espande il bordo nero nelle direzioni principali ma NON riempie gli angoli,
+    # riducendo l'erosione della forma quadrata degli edifici.
+    kernel = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
+
     dilated_borders = cv2.dilate(black_borders, kernel, iterations=1)
 
-    # Now remove the dilated borders from alpha to separate buildings
+    # Copiamo la maschera degli edifici e impostiamo a 0 (nero) i pixel
+    # dove passa il nostro bordo dilatato.
     building_mask = alpha.copy()
     building_mask[dilated_borders > 0] = 0
 
-    # Apply threshold to get binary mask
+    # Puliamo l'immagine risultante: tutto ciò che non è nero diventa bianco puro.
     _, binary = cv2.threshold(building_mask, 128, 255, cv2.THRESH_BINARY)
 
-    # Clean up small artifacts but preserve building separation
-    kernel_small = np.ones((2, 2), np.uint8)
-    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel_small, iterations=1)
+    # Rimuove rumore puntiforme (piccoli pixel isolati rimasti dopo il taglio)
+    # Qui usiamo ancora un kernel 3x3 classico perché è più efficace per pulire il rumore.
+    kernel_clean = np.ones((3, 3), np.uint8)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel_clean, iterations=1)
 
-    # Label each disconnected region as a separate building
+    # Conta le isole separate. Connettività default=8 (include le diagonali).
     num_labels, markers = cv2.connectedComponents(binary)
 
     print(
@@ -102,7 +112,6 @@ def snap_contours_to_borders(contours, black_borders, snap_distance=3):
 
     if len(border_pixels) == 0:
         return contours  # No borders to snap to
-
     snapped_contours = []
 
     for contour in contours:
@@ -131,6 +140,157 @@ def snap_contours_to_borders(contours, black_borders, snap_distance=3):
         snapped_contours.append(np.array(snapped_contour, dtype=np.int32))
 
     return snapped_contours
+
+
+def subdivide_edges_with_vertices(contours, tolerance=2.0):
+    """
+    OSM Topology Requirement: Insert vertices from adjacent polygons into edges.
+
+    If a vertex from polygon P2 lies on an edge of polygon P1, that edge must be
+    subdivided to include that vertex. This ensures proper topology for OSM.
+
+    Example from the diagram:
+        P1 = <A, B, C, D>
+        P2 = <E, F, G, H>
+
+    If E lies on edge B-C and C lies on edge H-E:
+        P1 becomes <A, B, E, C, D> (E inserted into B-C)
+        P2 becomes <E, F, G, H, C> (C inserted into H-E)
+
+    Args:
+        contours: List of contours (polygons)
+        tolerance: Maximum distance from edge to consider vertex "on" the edge
+
+    Returns:
+        List of contours with subdivided edges
+    """
+    # Collect all unique vertices from all polygons
+    all_vertices = set()
+    for contour in contours:
+        for point in contour:
+            all_vertices.add(tuple(point[0]))
+
+    print(f"Checking {len(all_vertices)} vertices against edges for subdivision...")
+
+    subdivided_contours = []
+    total_insertions = 0
+
+    for contour_idx, contour in enumerate(contours):
+        # Start with original vertices
+        new_vertices = []
+
+        # Process each edge of this polygon
+        num_vertices = len(contour)
+        for i in range(num_vertices):
+            # Current edge: from vertex i to vertex i+1 (wrapping around)
+            v1 = np.array(contour[i][0], dtype=float)
+            v2 = np.array(contour[(i + 1) % num_vertices][0], dtype=float)
+
+            # Add the starting vertex of this edge
+            new_vertices.append(v1)
+
+            # Find all vertices from OTHER polygons that lie on this edge
+            vertices_on_edge = []
+
+            for vertex in all_vertices:
+                vertex_array = np.array(vertex, dtype=float)
+
+                # Skip if this vertex is already one of the edge endpoints
+                if np.allclose(vertex_array, v1, atol=0.1) or np.allclose(
+                    vertex_array, v2, atol=0.1
+                ):
+                    continue
+
+                # Check if vertex lies on the line segment v1-v2
+                # Using point-to-line-segment distance
+                distance_to_segment = point_to_segment_distance(vertex_array, v1, v2)
+
+                if distance_to_segment <= tolerance:
+                    # This vertex lies on the edge! Calculate its position along the edge
+                    # for proper ordering
+                    t = project_point_onto_segment(vertex_array, v1, v2)
+                    if 0 < t < 1:  # Only if between v1 and v2, not beyond
+                        vertices_on_edge.append((t, vertex_array))
+
+            # Sort vertices by their position along the edge (by parameter t)
+            vertices_on_edge.sort(key=lambda x: x[0])
+
+            # Insert them in order
+            for t, vertex_to_insert in vertices_on_edge:
+                new_vertices.append(vertex_to_insert)
+                total_insertions += 1
+
+        # Convert back to contour format
+        if len(new_vertices) > 0:
+            subdivided_contour = np.array(
+                [[[int(v[0]), int(v[1])]] for v in new_vertices], dtype=np.int32
+            )
+            subdivided_contours.append(subdivided_contour)
+        else:
+            subdivided_contours.append(contour)
+
+    print(
+        f"  → Inserted {total_insertions} vertices into edges for OSM topology compliance"
+    )
+
+    return subdivided_contours
+
+
+def point_to_segment_distance(point, seg_start, seg_end):
+    """
+    Calculate the minimum distance from a point to a line segment.
+
+    Args:
+        point: Point as numpy array [x, y]
+        seg_start: Segment start as numpy array [x, y]
+        seg_end: Segment end as numpy array [x, y]
+
+    Returns:
+        Minimum distance from point to segment
+    """
+    # Vector from seg_start to seg_end
+    segment_vec = seg_end - seg_start
+    segment_length_sq = np.dot(segment_vec, segment_vec)
+
+    if segment_length_sq == 0:
+        # Degenerate segment (point)
+        return np.linalg.norm(point - seg_start)
+
+    # Parameter t: project point onto the line, t=0 at seg_start, t=1 at seg_end
+    t = np.dot(point - seg_start, segment_vec) / segment_length_sq
+
+    # Clamp t to [0, 1] to stay on the segment
+    t = max(0, min(1, t))
+
+    # Find the projection point
+    projection = seg_start + t * segment_vec
+
+    # Distance from point to projection
+    return np.linalg.norm(point - projection)
+
+
+def project_point_onto_segment(point, seg_start, seg_end):
+    """
+    Project a point onto a line segment and return the parameter t.
+
+    Args:
+        point: Point as numpy array [x, y]
+        seg_start: Segment start as numpy array [x, y]
+        seg_end: Segment end as numpy array [x, y]
+
+    Returns:
+        Parameter t where projection = seg_start + t * (seg_end - seg_start)
+        t = 0 means projection is at seg_start
+        t = 1 means projection is at seg_end
+    """
+    segment_vec = seg_end - seg_start
+    segment_length_sq = np.dot(segment_vec, segment_vec)
+
+    if segment_length_sq == 0:
+        return 0
+
+    t = np.dot(point - seg_start, segment_vec) / segment_length_sq
+    return t
 
 
 def merge_nearby_vertices(contours, merge_distance=2):
@@ -313,28 +473,30 @@ def remove_duplicate_vertices(contour):
 
 
 def find_building_contours(separated_mask):
-    """Find contours of individual buildings."""
+    # Converte le "isole" di pixel bianchi (raster) in linee geometriche (vettori)
+    # Restituisce:
+    # - contours: lista di array (i poligoni)
+    # - hierarchy: matrice che descrive chi è dentro chi (es. cortile dentro edificio)
     contours, hierarchy = cv2.findContours(
-        separated_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        separated_mask,  # Input: Immagine binaria a 1 canale (0=sfondo, 255=oggetto)
+        cv2.RETR_EXTERNAL, 
+        cv2.CHAIN_APPROX_SIMPLE,  # Ottimizzazione: Comprime segmenti orizzontali/verticali/diagonali salvando solo i vertici estremi (Lossless)
     )
-    return contours
+
+    # Nota sul TODO: Con RETR_TREE, 'hierarchy' è fondamentale per distinguere un edificio (Parent)
+    # dal suo cortile (Child). Senza analizzarla, i cortili saranno salvati come edifici "pieni".
+
+    return contours  # Lista di coordinate [(x,y), (x,y)...] per ogni edificio trovato
 
 
 def simplify_polygon(contour, epsilon_factor=3.0):
-    """
-    Simplify polygon using Douglas-Peucker algorithm.
-    This reduces vertices to corner points only.
+    """Applica l'algoritmo Ramer-Douglas-Peucker per ridurre i vertici."""
 
-    Uses a fixed epsilon value instead of perimeter-based to ensure
-    consistent simplification across all building sizes.
-    Small buildings should not have more vertices than large ones.
-    """
-    # Use a fixed epsilon value (in pixels) for consistent simplification
-    # epsilon_factor is now interpreted as a fixed pixel tolerance
-    # Typical good values: 2-5 pixels for building corners
+    # Converte input percentuali (<1.0) in pixel o usa il valore assoluto
     epsilon = epsilon_factor if epsilon_factor > 1 else epsilon_factor * 100
 
-    # Approximate polygon
+    # cv2.approxPolyDP(input, tolleranza_max_distanza, is_closed=True)
+    # Trasforma curve frastagliate in linee rette se l'errore è < epsilon
     approx = cv2.approxPolyDP(contour, epsilon, True)
 
     return approx
@@ -450,16 +612,16 @@ def save_debug_images(
     cv2.drawContours(simplified_img, simplified_contours, -1, (0, 255, 255), 2)  # Cyan
     cv2.imwrite(str(output_dir / "06b_simplified_before_snap.png"), simplified_img)
 
-    # 7. Final snapped polygons (topology-corrected, sharing boundaries)
+    # 7. Final OSM-topology polygons (after snapping + merging + edge subdivision)
     snapped_img = cv2.cvtColor(alpha, cv2.COLOR_GRAY2BGR)
     cv2.drawContours(snapped_img, snapped_contours, -1, (0, 0, 255), 2)  # Red
-    # Draw vertices
+    # Draw vertices with different colors for emphasis
     for contour in snapped_contours:
         for point in contour:
-            cv2.circle(snapped_img, tuple(point[0]), 3, (255, 0, 0), -1)
-    # Overlay original black borders in white for reference
+            cv2.circle(snapped_img, tuple(point[0]), 3, (255, 0, 0), -1)  # Blue dots
+    # Overlay original black borders in gray for reference
     snapped_img[black_borders > 0] = [128, 128, 128]
-    cv2.imwrite(str(output_dir / "07_final_snapped_polygons.png"), snapped_img)
+    cv2.imwrite(str(output_dir / "07_final_OSM_topology.png"), snapped_img)
 
     # 8. Three-way comparison: raw → simplified → snapped
     comparison = np.hstack([contour_img, simplified_img, snapped_img])
@@ -510,8 +672,12 @@ def process_wms_tile(image_path, output_dir=None, epsilon_factor=3.0):
     # 6. Simplify polygons to corner points FIRST
     simplified_contours = []
     for contour in contours:
+        # Calcola area in px^2 (Teorema di Gauss/Shoelace)
         area = cv2.contourArea(contour)
-        if area >= 50:  # Skip very small buildings
+
+        # Filtra rumore
+        if area >= 50:
+            # Semplifica la geometria riducendo i vertici
             simplified = simplify_polygon(contour, epsilon_factor)
             simplified_contours.append(simplified)
 
@@ -521,7 +687,7 @@ def process_wms_tile(image_path, output_dir=None, epsilon_factor=3.0):
     # This ensures adjacent buildings share exact vertices/edges
     # IMPORTANT: Do this AFTER simplification so final vertices are snapped
     # Snap distance needs to be larger because simplification can move vertices away
-    snap_distance = 15  # Larger to account for simplification displacement
+    snap_distance = 8  # Larger to account for simplification displacement
     snapped_contours = snap_contours_to_borders(
         simplified_contours, black_borders, snap_distance=snap_distance
     )
@@ -532,13 +698,22 @@ def process_wms_tile(image_path, output_dir=None, epsilon_factor=3.0):
     # 7b. Merge nearby vertices so adjacent buildings share exact same coordinates
     # After snapping to borders, vertices from different buildings on the same border
     # may snap to nearby but different pixels. This merges them into shared vertices.
-    merge_distance = 15  # Should be slightly larger than typical black border thickness
+    merge_distance = 5  # Should be slightly larger than typical black border thickness
     snapped_contours = merge_nearby_vertices(
         snapped_contours, merge_distance=merge_distance
     )
     print(
         f"Merged nearby vertices for shared boundaries (merge_distance={merge_distance}px)"
     )
+
+    # 7c. OSM TOPOLOGY: Subdivide edges with vertices from adjacent polygons
+    # If a vertex from polygon P2 lies on an edge of polygon P1, insert it into that edge.
+    # This is CRITICAL for OpenStreetMap compliance.
+    subdivision_tolerance = 2.0  # Maximum distance to consider vertex "on" an edge
+    snapped_contours = subdivide_edges_with_vertices(
+        snapped_contours, tolerance=subdivision_tolerance
+    )
+    print(f"Subdivided edges for OSM topology (tolerance={subdivision_tolerance}px)")
 
     print(f"Simplified to {len(simplified_contours)} valid polygons")
 
