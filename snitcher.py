@@ -2,7 +2,8 @@
 """
 Extract building polygons from WMS tile images.
 Buildings are orange polygons with black borders on transparent background.
-OPTIMIZED VERSION with multiprocessing and spatial indexing.
+
+OPTIMIZED VERSION: Uses geometric buffering instead of brute-force pixel search.
 """
 
 import sys
@@ -10,9 +11,10 @@ import cv2
 import numpy as np
 from pathlib import Path
 import json
-from scipy.spatial import cKDTree
-from multiprocessing import Pool, cpu_count
-import time
+
+# Required for geometric buffering optimization
+from shapely.geometry import Polygon, MultiPolygon
+from shapely.validation import make_valid
 
 
 def load_image(image_path):
