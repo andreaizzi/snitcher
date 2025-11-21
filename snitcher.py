@@ -731,12 +731,67 @@ def merge_nearby_vertices_old(contours, merge_distance=5):
     return merged_contours
 
 
-def find_building_contours(binary_mask):
-    """Extract contours from binary mask."""
+def find_building_contours(separated_mask):
+    """
+    Find contours of individual buildings, including holes (courtyards).
+    Uses RETR_CCOMP to get 2-level hierarchy: outer boundaries and holes.
+
+    Returns:
+        contours: List of all contours
+        hierarchy: Array describing parent-child relationships
+    """
     contours, hierarchy = cv2.findContours(
-        binary_mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE
+        separated_mask,
+        cv2.RETR_CCOMP,  # 2-level: outer boundaries and holes
+        cv2.CHAIN_APPROX_SIMPLE,
     )
-    return list(contours)
+    return contours, hierarchy
+
+
+def group_contours_with_holes(contours, hierarchy):
+    """
+    Group outer contours with their holes using OpenCV hierarchy.
+
+    Hierarchy format: [Next, Previous, First_Child, Parent]
+    - Parent = -1: outer boundary
+    - Parent >= 0: hole inside parent contour
+
+    Args:
+        contours: List of all contours from cv2.findContours
+        hierarchy: Hierarchy array from cv2.findContours
+
+    Returns:
+        List of dicts: [{'outer': contour, 'holes': [hole1, hole2, ...]}, ...]
+    """
+    if hierarchy is None or len(contours) == 0:
+        return [{"outer": c, "holes": []} for c in contours]
+
+    hierarchy = hierarchy[0]  # Remove extra dimension
+
+    # Build parent-child relationships
+    buildings = []
+    processed = set()
+
+    for i, contour in enumerate(contours):
+        # Skip if already processed as a hole
+        if i in processed:
+            continue
+
+        # Check if this is an outer boundary (parent = -1)
+        parent_idx = hierarchy[i][3]
+        if parent_idx == -1:
+            # This is an outer boundary
+            building = {"outer": contour, "holes": []}
+
+            # Find all holes (children with this contour as parent)
+            for j, h in enumerate(hierarchy):
+                if h[3] == i:  # Parent is current contour
+                    building["holes"].append(contours[j])
+                    processed.add(j)
+
+            buildings.append(building)
+
+    return buildings
 
 
 def simplify_polygon(contour, epsilon_factor=3.0):
@@ -891,10 +946,10 @@ def save_debug_images(
     print(f"Debug images saved to: {output_dir}")
 
 
-def process_wms_tile(image_path, output_dir=None, epsilon_factor=3.0):
+
+def process_wms_tile(image_path, output_dir=None, epsilon_factor=3.0, bbox=None):
     """
     Main processing pipeline for extracting building polygons.
-
     Args:
         image_path: Path to input PNG image
         output_dir: Directory for output files (default: same as input)
@@ -952,49 +1007,73 @@ def process_wms_tile(image_path, output_dir=None, epsilon_factor=3.0):
         f"Saved: 03b_dilated_borders.png, 04_separated_buildings.png, 05_connected_components.png"
     )
 
-    # 5. Find contours
-    contours = find_building_contours(separated)
-    print(f"Found {len(contours)} building contours")
+    # 5. Find contours including holes (courtyards)
+    all_contours, hierarchy = find_building_contours(markers)
+    print(f"Found {len(all_contours)} total contours")
     contour_img = cv2.cvtColor(alpha, cv2.COLOR_GRAY2BGR)
-    cv2.drawContours(contour_img, contours, -1, (0, 255, 0), 2)
+    cv2.drawContours(contour_img, all_contours, -1, (0, 255, 0), 2)
     cv2.imwrite(str(debug_dir / "06_detected_contours_raw.png"), contour_img)
     print(f"Saved: 06_detected_contours_raw.png")
 
-    # 6. Simplify polygons to corner points FIRST
-    simplified_contours = []
-    for contour in contours:
-        # Calcola area in px^2 (Teorema di Gauss/Shoelace)
-        area = cv2.contourArea(contour)
+    # 5b. Group contours into buildings with holes
+    buildings_raw = group_contours_with_holes(all_contours, hierarchy)
+    print(f"Grouped into {len(buildings_raw)} buildings (some may have holes)")
 
-        # Filtra rumore
-        if area >= 50:
-            # Semplifica la geometria riducendo i vertici
-            simplified = simplify_polygon(contour, epsilon_factor)
-            simplified_contours.append(simplified)
+ # Count buildings with holes
+    buildings_with_holes = sum(1 for b in buildings_raw if len(b.get('holes', [])) > 0)
+    if buildings_with_holes > 0:
+        print(f"  → {buildings_with_holes} buildings have courtyards/holes")
 
-    print(f"Simplified to {len(simplified_contours)} valid polygons")
-    # Save simplified contours
-    simplified_img = cv2.cvtColor(alpha, cv2.COLOR_GRAY2BGR)
-    cv2.drawContours(simplified_img, simplified_contours, -1, (0, 255, 255), 2)
-    cv2.imwrite(str(debug_dir / "06b_simplified_before_snap.png"), simplified_img)
+ # 6. Simplify polygons to corner points (both outer and holes)
+    buildings_simplified = []
+    for building in buildings_raw:
+        outer_area = cv2.contourArea(building['outer'])
+        if outer_area < 50:
+            continue
+            
+        simplified_building = {
+            'outer': simplify_polygon(building['outer'], epsilon_factor),
+            'holes': []
+        }
+        
+        # Simplify holes too
+        for hole in building.get('holes', []):
+            hole_area = cv2.contourArea(hole)
+            if hole_area >= 20:  # Minimum hole size
+                simplified_building['holes'].append(simplify_polygon(hole, epsilon_factor))
+        
+        buildings_simplified.append(simplified_building)
+    
+    print(f"Simplified to {len(buildings_simplified)} valid buildings")
 
-    # Save with vertices and borders for comparison
-    before_viz = cv2.cvtColor(alpha, cv2.COLOR_GRAY2BGR)
-    cv2.drawContours(before_viz, simplified_contours, -1, (0, 255, 0), 2)
-    for contour in simplified_contours:
-        for point in contour:
-            cv2.circle(before_viz, tuple(point[0]), 3, (255, 0, 0), -1)
-    before_viz[black_borders > 0] = [128, 128, 128]
-    cv2.imwrite(str(debug_dir / "06c_before_buffering.png"), before_viz)
-    print(f"Saved: 06b_simplified_before_snap.png, 06c_before_buffering.png")
+    # 7. Flatten buildings to contour list for topology operations
+    # We need to apply snapping/merging/subdivision to ALL contours (outer + holes)
+    all_simplified_contours = []
+    building_indices = []  # Track which building each contour belongs to
+    
+    for building_idx, building in enumerate(buildings_simplified):
+        all_simplified_contours.append(building['outer'])
+        building_indices.append((building_idx, 'outer'))
+        
+        for hole_idx, hole in enumerate(building.get('holes', [])):
+            all_simplified_contours.append(hole)
+            building_indices.append((building_idx, ('hole', hole_idx)))
+
+    # save images with vertices and borders for comparison
+    simplified_viz = cv2.cvtColor(alpha, cv2.COLOR_GRAY2BGR)
+    cv2.drawContours(simplified_viz, all_simplified_contours, -1, (0, 255, 255), 2)  # Cyan
+    cv2.imwrite(str(debug_dir / "06b_simplified_before_snap.png"), simplified_viz)
+    print(f"Saved: 06b_simplified_before_snap.png")
 
     # 7. OPTIMIZED: Snap simplified contours using geometric buffering
     # This replaces the O(V×P) pixel search with O(N×V) geometric operations
     # The offset_distance should match the dilation amount from separate_buildings()
     # (3×3 CROSS kernel with 1 iteration ≈ 2 pixels)
-    offset_distance = 2.0  # Match the dilation kernel effect deve restare a 2.0 - guarda riga sopra
+    offset_distance = (
+        0.0  # Match the dilation kernel effect deve restare a 2.0 - guarda riga sopra
+    )
     snapped_contours = snap_contours_to_borders(
-        simplified_contours, offset_distance=offset_distance
+        all_simplified_contours, offset_distance=offset_distance
     )
     print(
         f"Applied geometric buffering to close gaps (offset_distance={offset_distance}px)"
@@ -1037,6 +1116,27 @@ def process_wms_tile(image_path, output_dir=None, epsilon_factor=3.0):
         snapped_contours, tolerance=subdivision_tolerance
     )
     print(f"Subdivided edges for OSM topology (tolerance={subdivision_tolerance}px)")
+
+    # 7d. Reconstruct buildings from flattened contours
+    buildings_final = []
+    for building_idx in range(len(buildings_simplified)):
+        building_final = {'outer': None, 'holes': []}
+        
+        # Find all contours belonging to this building
+        for contour_idx, (bid, contour_type) in enumerate(building_indices):
+            if bid == building_idx:
+                if contour_type == 'outer':
+                    building_final['outer'] = snapped_contours[contour_idx]
+                elif isinstance(contour_type, tuple) and contour_type[0] == 'hole':
+                    building_final['holes'].append(snapped_contours[contour_idx])
+        
+        if building_final['outer'] is not None:
+            buildings_final.append(building_final)
+    
+    print(f"Final topology: {len(buildings_final)} buildings")
+    
+
+
     # Save final OSM topology
     final_viz = cv2.cvtColor(alpha, cv2.COLOR_GRAY2BGR)
     cv2.drawContours(final_viz, snapped_contours, -1, (0, 0, 255), 2)
@@ -1049,8 +1149,27 @@ def process_wms_tile(image_path, output_dir=None, epsilon_factor=3.0):
 
     print(f"Final polygon count: {len(snapped_contours)}")
 
-    # 8. Convert to GeoJSON (use snapped contours - the final result with topology)
-    geojson = contours_to_geojson(snapped_contours, img.shape)
+    snapped_img = cv2.cvtColor(alpha, cv2.COLOR_GRAY2BGR)
+    for building in buildings_final:
+        # Draw outer boundary in red
+        cv2.drawContours(snapped_img, [building['outer']], -1, (0, 0, 255), 2)
+        # Draw holes in magenta
+        for hole in building.get('holes', []):
+            cv2.drawContours(snapped_img, [hole], -1, (255, 0, 255), 2)
+        
+        # Draw vertices - blue for outer, green for holes
+        for point in building['outer']:
+            cv2.circle(snapped_img, tuple(point[0]), 3, (255, 0, 0), -1)
+        for hole in building.get('holes', []):
+            for point in hole:
+                cv2.circle(snapped_img, tuple(point[0]), 2, (0, 255, 0), -1)
+    
+    # Overlay original black borders in gray for reference
+    snapped_img[black_borders > 0] = [128, 128, 128]
+    cv2.imwrite(str(output_dir / "07-2_final_OSM_topology.png"), snapped_img)
+
+     # 9. Convert to GeoJSON (buildings with holes)
+    geojson = contours_to_geojson(buildings_final, img.shape, bbox=bbox)
 
     # 9. Save GeoJSON
     output_json = output_dir / "buildings.geojson"
