@@ -193,6 +193,125 @@ def merge_nearby_vertices(contours, merge_distance=2):
     return merged_contours
 
 
+def snap_shared_boundaries(contours, dilation_distance=2):
+    """
+    Snap nearby vertices together to create shared boundaries between adjacent buildings.
+
+    After dilation creates gaps, adjacent buildings have separate vertices that should
+    be the same. This function:
+    1. Finds clusters of vertices that are very close (within dilation_distance)
+    2. Replaces each cluster with a single shared vertex at the average position
+    3. Ensures adjacent buildings share edges properly
+
+    Args:
+        contours: List of contours (polygons)
+        dilation_distance: Maximum distance for vertices to be considered "same" (pixels)
+
+    Returns:
+        List of contours with snapped vertices
+    """
+    if not contours:
+        return contours
+
+    # Collect all vertices from all contours with their source information
+    all_vertices = []
+    for contour_idx, contour in enumerate(contours):
+        for point_idx, point in enumerate(contour):
+            x, y = point[0]
+            all_vertices.append(
+                {
+                    "x": x,
+                    "y": y,
+                    "contour_idx": contour_idx,
+                    "point_idx": point_idx,
+                    "original": (x, y),
+                }
+            )
+
+    if not all_vertices:
+        return contours
+
+    # Build clusters of nearby vertices using simple distance threshold
+    # This is O(n²) but works fine for typical building counts
+    tolerance = dilation_distance * 1.5  # Slightly larger than dilation gap
+    vertex_clusters = []
+    used = set()
+
+    for i, v1 in enumerate(all_vertices):
+        if i in used:
+            continue
+
+        cluster = [i]
+        used.add(i)
+
+        # Find all vertices within tolerance
+        for j, v2 in enumerate(all_vertices):
+            if j <= i or j in used:
+                continue
+
+            dist = np.sqrt((v1["x"] - v2["x"]) ** 2 + (v1["y"] - v2["y"]) ** 2)
+            if dist <= tolerance:
+                cluster.append(j)
+                used.add(j)
+
+        if len(cluster) > 0:
+            vertex_clusters.append(cluster)
+
+    # For each cluster, compute the average position (shared vertex)
+    shared_positions = {}
+    for cluster in vertex_clusters:
+        avg_x = np.mean([all_vertices[i]["x"] for i in cluster])
+        avg_y = np.mean([all_vertices[i]["y"] for i in cluster])
+        shared_pos = (int(round(avg_x)), int(round(avg_y)))
+
+        for vertex_idx in cluster:
+            shared_positions[vertex_idx] = shared_pos
+
+    # Rebuild contours with snapped vertices
+    snapped_contours = []
+    for contour_idx, contour in enumerate(contours):
+        new_points = []
+        for point_idx, point in enumerate(contour):
+            # Find this vertex in all_vertices list
+            vertex_idx = None
+            for idx, v in enumerate(all_vertices):
+                if v["contour_idx"] == contour_idx and v["point_idx"] == point_idx:
+                    vertex_idx = idx
+                    break
+
+            if vertex_idx is not None and vertex_idx in shared_positions:
+                # Use shared position
+                new_x, new_y = shared_positions[vertex_idx]
+            else:
+                # Keep original position
+                new_x, new_y = point[0]
+
+            new_points.append([[new_x, new_y]])
+
+        snapped_contours.append(np.array(new_points, dtype=np.int32))
+
+    print(f"Snapped {len(vertex_clusters)} vertex clusters to create shared boundaries")
+
+    return snapped_contours
+
+
+def remove_duplicate_vertices(contour):
+    """Remove consecutive duplicate vertices from a contour."""
+    if len(contour) < 2:
+        return contour
+
+    unique_points = [contour[0]]
+    for point in contour[1:]:
+        if not np.array_equal(point, unique_points[-1]):
+            unique_points.append(point)
+
+    # Check if first and last are the same
+    if len(unique_points) > 1 and np.array_equal(unique_points[0], unique_points[-1]):
+        unique_points = unique_points[:-1]
+
+    return np.array(unique_points, dtype=np.int32)
+
+
 def find_building_contours(separated_mask):
     """Find contours of individual buildings."""
     contours, hierarchy = cv2.findContours(
@@ -201,7 +320,7 @@ def find_building_contours(separated_mask):
     return contours
 
 
-def simplify_polygon(contour, epsilon_factor=0.002):
+def simplify_polygon(contour, epsilon_factor=3.0):
     """
     Simplify polygon using Douglas-Peucker algorithm.
     This reduces vertices to corner points only.
@@ -392,7 +511,7 @@ def process_wms_tile(image_path, output_dir=None, epsilon_factor=3.0):
     simplified_contours = []
     for contour in contours:
         area = cv2.contourArea(contour)
-        if area >= 50 or True:  # Skip very small buildings
+        if area >= 50:  # Skip very small buildings
             simplified = simplify_polygon(contour, epsilon_factor)
             simplified_contours.append(simplified)
 
@@ -401,8 +520,8 @@ def process_wms_tile(image_path, output_dir=None, epsilon_factor=3.0):
     # 7. Snap simplified contours to original black borders for proper topology
     # This ensures adjacent buildings share exact vertices/edges
     # IMPORTANT: Do this AFTER simplification so final vertices are snapped
-    # Use larger snap distance to account for simplification displacement
-    snap_distance = max(10, int(epsilon_factor * 2))  # Dynamic based on simplification
+    # Snap distance needs to be larger because simplification can move vertices away
+    snap_distance = 15  # Larger to account for simplification displacement
     snapped_contours = snap_contours_to_borders(
         simplified_contours, black_borders, snap_distance=snap_distance
     )
@@ -411,9 +530,15 @@ def process_wms_tile(image_path, output_dir=None, epsilon_factor=3.0):
     )
 
     # 7b. Merge nearby vertices so adjacent buildings share exact same coordinates
-    # Use larger merge_distance to account for black border thickness and snapping variation
-    snapped_contours = merge_nearby_vertices(snapped_contours, merge_distance=15)
-    print("Merged nearby vertices for shared boundaries (merge_distance=15px)")
+    # After snapping to borders, vertices from different buildings on the same border
+    # may snap to nearby but different pixels. This merges them into shared vertices.
+    merge_distance = 15  # Should be slightly larger than typical black border thickness
+    snapped_contours = merge_nearby_vertices(
+        snapped_contours, merge_distance=merge_distance
+    )
+    print(
+        f"Merged nearby vertices for shared boundaries (merge_distance={merge_distance}px)"
+    )
 
     print(f"Simplified to {len(simplified_contours)} valid polygons")
 
