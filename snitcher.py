@@ -37,21 +37,23 @@ def extract_alpha_mask(img):
 
 
 def extract_black_borders(img, alpha):
-    """Extract black border lines (VECTORIZED)."""
-    # Opaque pixels
+    """Estrae le linee nere (bordi) che separano gli edifici."""
+
+    # Genera una matrice Booleana (True/False): ignora lo sfondo trasparente vuoto
     opaque_mask = alpha > 128
 
-    # BGR channels
+    # Se l'immagine è BGRA (4 canali), scarta l'ultimo (Alpha) per analizzare solo il colore
     if img.shape[2] == 4:
-        bgr = img[:, :, :3]
+        bgr = img[:, :, :3]  # Prendi tutti i pixel, ma solo i primi 3 canali (B, G, R)
     else:
         bgr = img
 
-    # Vectorized black detection: all channels < 100
-    black_mask = (
-        (bgr[:, :, 0] < 100) & (bgr[:, :, 1] < 100) & (bgr[:, :, 2] < 100) & opaque_mask
-    )
+    # Prendi i pixel neri
+    # np.all(..., axis=2): Controlla se B, G e R sono TUTTI scuri (< 100) nello stesso pixel.
+    # & opaque_mask: ...ma SOLO se il pixel non è trasparente.
+    black_mask = np.all(bgr < 100, axis=2) & opaque_mask
 
+    # Trasforma True/False in 1/0 (uint8), poi in 255/0 per avere Bianco/Nero
     return black_mask.astype(np.uint8) * 255
 
 
