@@ -59,28 +59,35 @@ def extract_black_borders(img, alpha):
 
 def separate_buildings(alpha, black_borders):
     """
-    Separate attached buildings using black borders as separators.
-    The key insight: black borders are drawn ON TOP of orange pixels, so we need to
-    DILATE them first to create actual gaps between buildings before removal.
+    Separa gli edifici attaccati usando i bordi neri come separatori.
+    Usa una dilatazione a CROCE per preservare meglio gli angoli retti.
     """
-    # CRITICAL: Dilate black borders to create separation gaps
-    # This ensures buildings are actually disconnected when we remove the borders
-    # Using iterations=3 for more aggressive separation
-    kernel = np.ones((2, 2), np.uint8)
+
+    # Usiamo MORPH_CROSS dimensione 3x3.
+    # Forma:
+    #   0 1 0
+    #   1 1 1
+    #   0 1 0
+    # Questo espande il bordo nero nelle direzioni principali ma NON riempie gli angoli,
+    # riducendo l'erosione della forma quadrata degli edifici.
+    kernel = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
+
     dilated_borders = cv2.dilate(black_borders, kernel, iterations=1)
 
-    # Now remove the dilated borders from alpha to separate buildings
+    # Copiamo la maschera degli edifici e impostiamo a 0 (nero) i pixel
+    # dove passa il nostro bordo dilatato.
     building_mask = alpha.copy()
     building_mask[dilated_borders > 0] = 0
 
-    # Apply threshold to get binary mask
+    # Puliamo l'immagine risultante: tutto ciò che non è nero diventa bianco puro.
     _, binary = cv2.threshold(building_mask, 128, 255, cv2.THRESH_BINARY)
 
-    # Clean up small artifacts but preserve building separation
-    kernel_small = np.ones((2, 2), np.uint8)
-    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel_small, iterations=1)
+    # Rimuove rumore puntiforme (piccoli pixel isolati rimasti dopo il taglio)
+    # Qui usiamo ancora un kernel 3x3 classico perché è più efficace per pulire il rumore.
+    kernel_clean = np.ones((3, 3), np.uint8)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel_clean, iterations=1)
 
-    # Label each disconnected region as a separate building
+    # Conta le isole separate. Connettività default=8 (include le diagonali).
     num_labels, markers = cv2.connectedComponents(binary)
 
     print(
