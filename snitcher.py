@@ -514,77 +514,72 @@ def point_to_segment_distance(point, segment_start, segment_end):
     """Calculate the shortest distance from a point to a line segment."""
     # Vector from segment_start to segment_end
     segment_vec = segment_end - segment_start
-
-    if segment_length_sq == 0:
-        # Degenerate segment (point)
-        return np.linalg.norm(point - seg_start)
-
-    # Parameter t: project point onto the line, t=0 at seg_start, t=1 at seg_end
-    t = np.dot(point - seg_start, segment_vec) / segment_length_sq
-
-    # Clamp t to [0, 1] to stay on the segment
-    t = max(0, min(1, t))
-
-    # Find the projection point
-    projection = seg_start + t * segment_vec
-
-    # Distance from point to projection
-    return np.linalg.norm(point - projection)
-
-
-def project_point_onto_segment(point, seg_start, seg_end):
-    """
-    Project a point onto a line segment and return the parameter t.
-
-    Args:
-        point: Point as numpy array [x, y]
-        seg_start: Segment start as numpy array [x, y]
-        seg_end: Segment end as numpy array [x, y]
-
-    Returns:
-        Parameter t where projection = seg_start + t * (seg_end - seg_start)
-        t = 0 means projection is at seg_start
-        t = 1 means projection is at seg_end
-    """
-    segment_vec = seg_end - seg_start
     segment_length_sq = np.dot(segment_vec, segment_vec)
 
-    if segment_length_sq == 0:
+    if segment_length_sq < 1e-10:  # Degenerate segment (point)
+        return np.linalg.norm(point - segment_start)
+
+    # Project point onto the line defined by the segment
+    # t = 0 means point projects to segment_start
+    # t = 1 means point projects to segment_end
+    t = np.dot(point - segment_start, segment_vec) / segment_length_sq
+
+    # Clamp t to [0, 1] to stay on the segment
+    t = np.clip(t, 0, 1)
+
+    # Find the closest point on the segment
+    closest_point = segment_start + t * segment_vec
+
+    # Return distance to closest point
+    return np.linalg.norm(point - closest_point)
+
+
+def project_point_onto_segment(point, segment_start, segment_end):
+    """
+    Project a point onto a line segment and return the parameter t.
+    t = 0 means the projection is at segment_start
+    t = 1 means the projection is at segment_end
+    t in (0, 1) means the projection is between the endpoints
+    """
+    segment_vec = segment_end - segment_start
+    segment_length_sq = np.dot(segment_vec, segment_vec)
+
+    if segment_length_sq < 1e-10:  # Degenerate segment
         return 0
 
-    t = np.dot(point - seg_start, segment_vec) / segment_length_sq
+    t = np.dot(point - segment_start, segment_vec) / segment_length_sq
     return t
 
 
-def merge_nearby_vertices(contours, merge_distance=2):
+def merge_nearby_vertices(contours, merge_distance=5):
     """
-    Merge nearby vertices using KDTree (OPTIMIZED).
-    O(n log n) instead of O(n²).
+    Merge nearby vertices so adjacent buildings share exact coordinates.
+    OPTIMIZED with spatial indexing.
     """
-    # Collect all vertices with their source info
-    vertices_list = []
-    vertex_map = {}  # (contour_idx, point_idx) -> vertex_idx
+    from scipy.spatial import cKDTree
+
+    # Collect all vertices with their source information
+    all_vertices = []
+    vertex_info = []  # (x, y, contour_idx, point_idx)
 
     for contour_idx, contour in enumerate(contours):
-        for point_idx in range(len(contour)):
-            x, y = contour[point_idx][0]
-            vertex_idx = len(vertices_list)
-            vertices_list.append([x, y])
-            vertex_map[(contour_idx, point_idx)] = vertex_idx
+        for point_idx, point in enumerate(contour):
+            x, y = point[0]
+            all_vertices.append([float(x), float(y)])
+            vertex_info.append((x, y, contour_idx, point_idx))
 
-    if not vertices_list:
+    if len(all_vertices) == 0:
         return contours
 
-    vertices_array = np.array(vertices_list, dtype=float)
-
-    # Build KDTree
-    kdtree = cKDTree(vertices_array)
+    # Build KD-tree
+    vertex_array = np.array(all_vertices)
+    kdtree = cKDTree(vertex_array)
 
     # Find all pairs within merge_distance
-    pairs = kdtree.query_pairs(merge_distance, output_type="ndarray")
+    pairs = kdtree.query_pairs(merge_distance)
 
-    # Build clusters using Union-Find
-    parent = list(range(len(vertices_list)))
+    # Build clusters using union-find
+    parent = list(range(len(all_vertices)))
 
     def find(x):
         if parent[x] != x:
@@ -599,76 +594,148 @@ def merge_nearby_vertices(contours, merge_distance=2):
     for i, j in pairs:
         union(i, j)
 
-    # Compute cluster centroids
+    # Group vertices by cluster
     clusters = {}
-    for i in range(len(vertices_list)):
+    for i in range(len(all_vertices)):
         root = find(i)
         if root not in clusters:
             clusters[root] = []
         clusters[root].append(i)
 
-    centroid_map = {}
-    for root, members in clusters.items():
-        centroid = vertices_array[members].mean(axis=0)
-        centroid_map[root] = (int(round(centroid[0])), int(round(centroid[1])))
+    # Calculate average position for each cluster
+    vertex_mapping = {}
+    for cluster_indices in clusters.values():
+        if len(cluster_indices) > 1:
+            avg_x = int(np.mean([all_vertices[i][0] for i in cluster_indices]))
+            avg_y = int(np.mean([all_vertices[i][1] for i in cluster_indices]))
+            for idx in cluster_indices:
+                vertex_mapping[idx] = (avg_x, avg_y)
 
     # Update contours
     merged_contours = []
-    for contour_idx, contour in enumerate(contours):
-        new_points = []
-        for point_idx in range(len(contour)):
-            vertex_idx = vertex_map[(contour_idx, point_idx)]
-            root = find(vertex_idx)
-            new_x, new_y = centroid_map[root]
-            new_points.append([[new_x, new_y]])
-        merged_contours.append(np.array(new_points, dtype=np.int32))
+    for contour in contours:
+        merged_contours.append(contour.copy())
 
-    if clusters:
-        print(f"  → Merged {len(clusters)} groups of nearby vertices")
+    vertex_idx = 0
+    for contour_idx, contour in enumerate(contours):
+        for point_idx in range(len(contour)):
+            if vertex_idx in vertex_mapping:
+                new_x, new_y = vertex_mapping[vertex_idx]
+                merged_contours[contour_idx][point_idx][0][0] = new_x
+                merged_contours[contour_idx][point_idx][0][1] = new_y
+            vertex_idx += 1
+
+    num_merged = len(vertex_mapping)
+    if num_merged > 0:
+        print(f"  → Merged {num_merged} vertices into {len(clusters)} clusters")
 
     return merged_contours
 
 
-def find_building_contours(separated_mask):
-    """Find contours of individual buildings."""
+def merge_nearby_vertices_old(contours, merge_distance=5):
+    """
+    Unisce i vertici di edifici diversi che sono molto vicini tra loro.
+    Garantisce la correttezza topologica (nodi condivisi) per OpenStreetMap.
+    """
+
+    # 1. Flattening (Appiattimento): Raccoglie tutti i vertici in una lista globale
+    # Salva le coordinate e la "provenienza" (ID edificio, indice punto) per rintracciarli dopo
+    all_vertices = []
+    for contour_idx, contour in enumerate(contours):
+        for point_idx, point in enumerate(contour):
+            x, y = point[0]
+            all_vertices.append((x, y, contour_idx, point_idx))
+
+    # 2. Indicizzazione Spaziale (Spatial Hashing) - Ottimizzazione O(1)
+    # Divide la mappa in una griglia per evitare il confronto quadratico "tutti contro tutti"
+    from collections import defaultdict
+
+    grid_size = merge_distance * 2  # Dimensione cella sicura per trovare vicini
+    grid = defaultdict(list)
+
+    # Inserisce ("hasha") ogni vertice nel "bucket" (cella) corrispondente alle sue coordinate
+    for x, y, contour_idx, point_idx in all_vertices:
+        grid_x = int(x / grid_size)
+        grid_y = int(y / grid_size)
+        grid[(grid_x, grid_y)].append((x, y, contour_idx, point_idx))
+
+    # 3. Clustering: Ricerca dei vicini prossimi
+    visited = set()
+    clusters = []
+
+    for x, y, contour_idx, point_idx in all_vertices:
+        if (contour_idx, point_idx) in visited:
+            continue
+
+        # Cerca candidati solo nella cella corrente e nelle 8 celle adiacenti (kernel 3x3)
+        cluster = []
+        grid_x = int(x / grid_size)
+        grid_y = int(y / grid_size)
+
+        for dx in [-1, 0, 1]:
+            for dy in [-1, 0, 1]:
+                for vx, vy, v_contour_idx, v_point_idx in grid[
+                    (grid_x + dx, grid_y + dy)
+                ]:
+                    if (v_contour_idx, v_point_idx) in visited:
+                        continue
+
+                    # Calcolo esatto distanza Euclidea solo sui candidati vicini
+                    dist = np.sqrt((x - vx) ** 2 + (y - vy) ** 2)
+                    if dist <= merge_distance:
+                        cluster.append((vx, vy, v_contour_idx, v_point_idx))
+                        visited.add((v_contour_idx, v_point_idx))
+
+        if cluster:
+            clusters.append(cluster)
+
+    print(f"Found {len(clusters)} vertex clusters to merge")
+
+    # 4. Calcolo dei Centroidi (Merging)
+    # Sostituisce ogni gruppo di vertici vicini con un unico punto medio condiviso
+    vertex_replacements = (
+        {}
+    )  # Lookup Table: (ID_Edificio, ID_Punto) -> (Nuova_X, Nuova_Y)
+    total_vertices_merged = 0
+
+    for cluster in clusters:
+        # Il nuovo vertice sarà il baricentro (media aritmetica) del cluster
+        centroid_x = int(np.mean([v[0] for v in cluster]))
+        centroid_y = int(np.mean([v[1] for v in cluster]))
+
+        # Mappa tutti i membri del cluster verso le nuove coordinate unificate
+        for vx, vy, contour_idx, point_idx in cluster:
+            vertex_replacements[(contour_idx, point_idx)] = (centroid_x, centroid_y)
+
+        if len(cluster) > 1:
+            total_vertices_merged += len(cluster)
+
+    print(f"Total vertices merged into shared points: {total_vertices_merged}")
+
+    # 5. Ricostruzione dei Contorni
+    # Riassembla i poligoni applicando le sostituzioni dove necessario
+    merged_contours = []
+    for contour_idx, contour in enumerate(contours):
+        new_contour = []
+        for point_idx, point in enumerate(contour):
+            # Se il vertice è stato fuso, usa le coordinate del centroide, altrimenti le originali
+            if (contour_idx, point_idx) in vertex_replacements:
+                new_x, new_y = vertex_replacements[(contour_idx, point_idx)]
+                new_contour.append([[new_x, new_y]])
+            else:
+                new_contour.append(point.tolist())
+
+        merged_contours.append(np.array(new_contour, dtype=np.int32))
+
+    return merged_contours
+
+
+def find_building_contours(binary_mask):
+    """Extract contours from binary mask."""
     contours, hierarchy = cv2.findContours(
-        separated_mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE
+        binary_mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE
     )
-    return contours
-
-
-def simplify_polygon_worker(args):
-    """Worker function for parallel polygon simplification."""
-    contour, epsilon_factor = args
-    area = cv2.contourArea(contour)
-    if area >= 50:
-        return simplify_polygon(contour, epsilon_factor)
-    return None
-
-
-def simplify_polygons_parallel(contours, epsilon_factor, n_jobs=None):
-    """Simplify polygons in parallel using multiprocessing."""
-    if n_jobs is None:
-        n_jobs = max(1, cpu_count() - 1)
-
-    # Prepare args
-    args_list = [(contour, epsilon_factor) for contour in contours]
-
-    # Use multiprocessing only if worth it (many contours)
-    if len(contours) < 20 or n_jobs == 1:
-        # Sequential for small workloads
-        simplified = []
-        for contour in contours:
-            area = cv2.contourArea(contour)
-            if area >= 50:
-                simplified.append(simplify_polygon(contour, epsilon_factor))
-        return simplified
-
-    # Parallel processing
-    with Pool(n_jobs) as pool:
-        results = pool.map(simplify_polygon_worker, args_list)
-
-    return [r for r in results if r is not None]
+    return list(contours)
 
 
 def simplify_polygon(contour, epsilon_factor=3.0):
