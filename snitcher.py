@@ -540,78 +540,6 @@ def contours_to_geojson(buildings, image_shape, bbox=None):
     return geojson
 
 
-def save_debug_images(
-    output_dir,
-    img,
-    alpha,
-    black_borders,
-    dilated_borders,
-    separated,
-    markers,
-    contours,
-    simplified_contours,
-    snapped_contours,
-):
-    """Save debug visualizations."""
-    output_dir = Path(output_dir)
-    output_dir.mkdir(exist_ok=True, parents=True)
-
-    # 1. Original image
-    cv2.imwrite(str(output_dir / "01_original.png"), img)
-
-    # 2. Alpha channel
-    cv2.imwrite(str(output_dir / "02_alpha_mask.png"), alpha)
-
-    # 3. Black borders
-    cv2.imwrite(str(output_dir / "03_black_borders.png"), black_borders)
-
-    # 3b. Dilated borders (the actual separators)
-    cv2.imwrite(str(output_dir / "03b_dilated_borders.png"), dilated_borders)
-
-    # 4. Separated buildings
-    cv2.imwrite(str(output_dir / "04_separated_buildings.png"), separated)
-
-    # 5. Connected components (colorized - each building in different color)
-    markers_viz = (
-        np.zeros_like(img[:, :, :3])
-        if img.shape[2] == 4
-        else np.zeros((*img.shape[:2], 3), dtype=np.uint8)
-    )
-    if markers is not None:
-        # Create a color for each building
-        markers_colored = (markers * 50 % 255).astype(np.uint8)
-        markers_viz = cv2.applyColorMap(markers_colored, cv2.COLORMAP_JET)
-        markers_viz[markers == 0] = 0  # Keep background black
-    cv2.imwrite(str(output_dir / "05_connected_components.png"), markers_viz)
-
-    # 6. Detected contours (raw, with gaps)
-    contour_img = cv2.cvtColor(alpha, cv2.COLOR_GRAY2BGR)
-    cv2.drawContours(contour_img, contours, -1, (0, 255, 0), 2)
-    cv2.imwrite(str(output_dir / "06_detected_contours_raw.png"), contour_img)
-
-    # 6b. Simplified polygons (before snapping)
-    simplified_img = cv2.cvtColor(alpha, cv2.COLOR_GRAY2BGR)
-    cv2.drawContours(simplified_img, simplified_contours, -1, (0, 255, 255), 2)  # Cyan
-    cv2.imwrite(str(output_dir / "06b_simplified_before_snap.png"), simplified_img)
-
-    # 7. Final OSM-topology polygons (after snapping + merging + edge subdivision)
-    snapped_img = cv2.cvtColor(alpha, cv2.COLOR_GRAY2BGR)
-    cv2.drawContours(snapped_img, snapped_contours, -1, (0, 0, 255), 2)  # Red
-    # Draw vertices with different colors for emphasis
-    for contour in snapped_contours:
-        for point in contour:
-            cv2.circle(snapped_img, tuple(point[0]), 3, (255, 0, 0), -1)  # Blue dots
-    # Overlay original black borders in gray for reference
-    snapped_img[black_borders > 0] = [128, 128, 128]
-    cv2.imwrite(str(output_dir / "07_final_OSM_topology.png"), snapped_img)
-
-    # 8. Three-way comparison: raw → simplified → snapped
-    comparison = np.hstack([contour_img, simplified_img, snapped_img])
-    cv2.imwrite(str(output_dir / "08_comparison.png"), comparison)
-
-    print(f"Debug images saved to: {output_dir}")
-
-
 def process_wms_tile(image_path, output_dir=None, epsilon_factor=3.0, bbox=None):
     """
     Main processing pipeline for extracting building polygons.
@@ -634,7 +562,8 @@ def process_wms_tile(image_path, output_dir=None, epsilon_factor=3.0, bbox=None)
     output_dir.mkdir(exist_ok=True)
 
     # Setup debug directory
-    debug_dir = output_dir / "debug"
+    # unique folder name for each execution based on time
+    debug_dir = output_dir / datetime.now().strftime("%Y%m%d_%H%M%S")
     debug_dir.mkdir(exist_ok=True, parents=True)
 
     # 1. Load image
