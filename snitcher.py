@@ -1303,7 +1303,6 @@ def process_wms_tile(image_path, output_dir=None, epsilon_factor=3.0, bbox=None)
 
 
 def main():
-    print("aaaaaaaa")
     if len(sys.argv) < 2:
         print("Usage: python extract_buildings.py <image_path> [output_dir] [epsilon] [bbox]")
         print("\nArguments:")
