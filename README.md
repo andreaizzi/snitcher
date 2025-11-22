@@ -1,6 +1,6 @@
 ﻿# Snitcher
 
-![cover.jpg](examples\cover.jpg)
+![cover.jpg](./examples/cover.jpg)
 
 > [!NOTE]
 > **STATUS - Work in progress:** This project is currently in a functional prototype stage. APIs, CLI arguments, and internal logic are subject to change.
@@ -188,4 +188,5 @@ The following features are planned for future releases:
 ---
 
 *Disclaimer: This tool is intended for data analysis and research purposes. Users must comply with the terms of service of the Agenzia delle Entrate WMS server.*
+
 
