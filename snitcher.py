@@ -6,7 +6,11 @@ Buildings are orange polygons with black borders on transparent background.
 OPTIMIZED VERSION: Uses geometric buffering instead of brute-force pixel search.
 """
 
+import json
 import sys
+from datetime import datetime
+from pathlib import Path
+
 import cv2
 import numpy as np
 
@@ -81,7 +85,8 @@ def separate_buildings(alpha, black_borders):
     kernel_clean = np.ones((3, 3), np.uint8)
     binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel_clean, iterations=1)
 
-    # Conta le isole separate. Connettività default=8 (include le diagonali).
+    # Conta le isole separate. Connettività 4 (orizzontale/verticale) per evitare di collegare
+    # diagonalmente edifici adiacenti.
     num_labels, markers = cv2.connectedComponents(binary, connectivity=4)
 
     print(
@@ -666,35 +671,12 @@ def process_wms_tile(image_path, output_dir=None, epsilon_factor=3.0, bbox=None)
     cv2.imwrite(str(debug_dir / "06b_simplified_before_snap.png"), simplified_viz)
     print(f"Saved: 06b_simplified_before_snap.png")
 
-    # 7. OPTIMIZED: Snap simplified contours using geometric buffering
-    # This replaces the O(V×P) pixel search with O(N×V) geometric operations
-    # The offset_distance should match the dilation amount from separate_buildings()
-    # (3×3 CROSS kernel with 1 iteration ≈ 2 pixels)
-    offset_distance = (
-        0.0  # Match the dilation kernel effect deve restare a 2.0 - guarda riga sopra
-    )
-    snapped_contours = snap_contours_to_borders(
-        all_simplified_contours, offset_distance=offset_distance
-    )
-    print(
-        f"Applied geometric buffering to close gaps (offset_distance={offset_distance}px)"
-    )
-    # Save snapped contours immediately after buffering
-    snapped_viz = cv2.cvtColor(alpha, cv2.COLOR_GRAY2BGR)
-    cv2.drawContours(snapped_viz, snapped_contours, -1, (0, 0, 255), 2)
-    for contour in snapped_contours:
-        for point in contour:
-            cv2.circle(snapped_viz, tuple(point[0]), 3, (255, 0, 0), -1)
-    snapped_viz[black_borders > 0] = [128, 128, 128]
-    cv2.imwrite(str(debug_dir / "07a_after_buffering.png"), snapped_viz)
-    print(f"Saved: 07a_after_buffering.png")
-
     # 7b. Merge nearby vertices so adjacent buildings share exact same coordinates
     # After buffering, vertices from different buildings near the same border
     # may be close but not identical. This merges them into shared vertices.
     merge_distance = 6  # Should be slightly larger than typical black border thickness
     snapped_contours = merge_nearby_vertices(
-        snapped_contours, merge_distance=merge_distance
+        all_simplified_contours, merge_distance=merge_distance
     )
     print(
         f"Merged nearby vertices for shared boundaries (merge_distance={merge_distance}px)"
@@ -713,7 +695,7 @@ def process_wms_tile(image_path, output_dir=None, epsilon_factor=3.0, bbox=None)
     # If a vertex from polygon P2 lies on an edge of polygon P1, insert it into that edge.
     # This is CRITICAL for OpenStreetMap compliance.
     subdivision_tolerance = 8.0  # Maximum distance to consider vertex "on" an edge
-    snapped_contours = subdivide_edges_with_vertices_opt_new(
+    snapped_contours = subdivide_edges_with_vertices(
         snapped_contours, tolerance=subdivision_tolerance
     )
     print(f"Subdivided edges for OSM topology (tolerance={subdivision_tolerance}px)")
