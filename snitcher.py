@@ -764,13 +764,13 @@ def process_wms_tile(image_path, output_dir=None, epsilon_factor=3.0, bbox=None)
 
     # Overlay original black borders in gray for reference
     snapped_img[black_borders > 0] = [128, 128, 128]
-    cv2.imwrite(str(output_dir / "07-2_final_OSM_topology.png"), snapped_img)
+    cv2.imwrite(str(debug_dir / "08_final_OSM_topology.png"), snapped_img)
 
     # 9. Convert to GeoJSON (buildings with holes)
     geojson = contours_to_geojson(buildings_final, img.shape, bbox=bbox)
 
     # 10. Save GeoJSON
-    output_json = output_dir / "buildings.geojson"
+    output_json = debug_dir / "buildings.geojson"
     with open(output_json, "w") as f:
         json.dump(geojson, f, indent=2)
 
