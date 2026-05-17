@@ -1,5 +1,7 @@
 # Snitcher
 
+![cover.jpg](./docs/cover.jpg)
+
 Snitcher is a geospatial software pipeline that bridges the Italian Cadastral Cartography (Catasto) and open-source mapping platforms. It extracts high-precision building footprints from the Italian Cadastre via Web Map Service (WMS) layers, vectorises them into topologically valid polygons, and reconciles them against independent building footprints derived from satellite imagery, in order to surface discrepancies between declared and physically existing buildings.
 
 ## Goals
